@@ -8,16 +8,11 @@ import logging
 from datetime import datetime
 
 # --- CONFIGURATION ---
-# Ton lien DATAtourisme complet avec ta clé
 DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade" 
-
-# Variables Railway (à configurer dans l'onglet "Variables" de Railway)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
 DB_NAME = "cezap.db"
 
-# Logging pour le suivi sur Railway
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -50,30 +45,18 @@ def save_alert(item_id, client_nom):
 def get_alim_confiance(ville="Paris"):
     deals = []
     url = "https://dgal.opendatasoft.com/api/records/1.0/search/"
-    params = {
-        "dataset": "export_alimconfiance",
-        "q": ville,
-        "refine.region": "ÎLE-DE-FRANCE",
-        "rows": 5,
-        "refine.synthese_eval_sanitaire": "Très satisfaisant"
-    }
+    params = {"dataset": "export_alimconfiance", "q": ville, "rows": 5, "refine.synthese_eval_sanitaire": "Très satisfaisant"}
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
                 nom = f.get("app_libelle_etablissement")
-                commune = f.get("libelle_commune", "")
-                
-                deal_id = "alim_" + hashlib.md5(f"{nom}{commune}".encode()).hexdigest()[:12]
+                deal_id = "alim_" + hashlib.md5(f"{nom}".encode()).hexdigest()[:12]
                 deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": f"{f.get('adresse_2_ua', '')} {commune}",
-                    "categorie": "Restaurant (Hygiène Top ★★★)",
-                    "image": None,
-                    "url": f"https://www.google.com/search?q={nom}+{commune}",
-                    "source": "Alim'confiance"
+                    "id": deal_id, "titre": nom, "lieu": f.get("libelle_commune", ""),
+                    "categorie": "Restaurant (Hygiène Top ★★★)", "image": None,
+                    "url": f"https://www.google.com/search?q={nom}", "source": "Alim'confiance"
                 })
     except Exception as e: logger.error(f"Erreur Alim: {e}")
     return deals
@@ -84,35 +67,49 @@ def get_datatourisme():
     try:
         resp = requests.get(DATATOURISME_FLUX_URL, timeout=15)
         if resp.status_code == 200:
-            data = resp.json()
-            items = data.get("@graph", [])
-            for item in items:
+            items = resp.json().get("@graph", [])
+            for item in items[:10]:
                 nom = item.get("rdfs:label", {}).get("@value")
                 if not nom: continue
-                
-                # Récupération image
-                img_url = None
-                if "hasMainRepresentation" in item:
-                    try:
-                        img_url = item["hasMainRepresentation"]["ebucore:hasRelatedResource"]["ebucore:locate"]["@id"]
-                    except: pass
-
                 deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
                 deals.append({
-                    "id": deal_id,
-                    "titre": nom,
+                    "id": deal_id, "titre": nom, 
                     "lieu": item.get("isLocatedAt", [{}]).get("schema:address", [{}]).get("schema:addressLocality", "IDF"),
-                    "categorie": "Sortie & Loisirs",
-                    "image": img_url,
-                    "url": item.get("@id", "https://www.datatourisme.fr"),
-                    "source": "DATAtourisme"
+                    "categorie": "Sortie & Loisirs", "image": None,
+                    "url": item.get("@id", "https://www.datatourisme.fr"), "source": "DATAtourisme"
                 })
     except Exception as e: logger.error(f"Erreur DATAtourisme: {e}")
     return deals
 
+# --- SOURCE 3 : EVENEMENTS (OpenAgenda) ---
+def get_open_agenda():
+    deals = []
+    # Ici on utilise l'agenda "Sortir en Île-de-France" (UID: 89803504)
+    url = "https://openagenda.com/agendas/89803504/events.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            events = resp.json().get("events", [])
+            for e in events[:5]:
+                nom = e.get("title", {}).get("fr")
+                deal_id = "open_" + str(e.get("uid"))
+                deals.append({
+                    "id": deal_id,
+                    "titre": nom,
+                    "lieu": e.get("locationName", "IDF"),
+                    "categorie": "Événement / Expo",
+                    "image": e.get("image"),
+                    "url": f"https://openagenda.com/event/{e.get('slug')}",
+                    "source": "OpenAgenda"
+                })
+    except Exception as e: logger.error(f"Erreur OpenAgenda: {e}")
+    return deals
+
 # --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
-    emoji = "🍴" if deal['source'] == "Alim'confiance" else "🎡"
+    emojis = {"Alim'confiance": "🍴", "DATAtourisme": "🎡", "OpenAgenda": "📅"}
+    emoji = emojis.get(deal['source'], "✨")
+    
     caption = (
         f"{emoji} *PROPOSITION CEZAP*\n\n"
         f"🎯 *{deal['titre']}*\n"
@@ -121,12 +118,15 @@ def envoyer_telegram(deal):
         f"🔗 [Voir les détails]({deal['url']})"
     )
     
+    method = "sendPhoto" if deal.get("image") else "sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown"}
+    
     if deal.get("image"):
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        payload = {"chat_id": CHAT_ID, "photo": deal["image"], "caption": caption, "parse_mode": "Markdown"}
+        payload["photo"] = deal["image"]
+        payload["caption"] = caption
     else:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": caption, "parse_mode": "Markdown"}
+        payload["text"] = caption
         
     try:
         requests.post(url, json=payload, timeout=10)
@@ -136,7 +136,8 @@ def envoyer_telegram(deal):
 def job():
     logger.info("Lancement du Scan Cezap...")
     init_db()
-    alertes = get_alim_confiance() + get_datatourisme()
+    # On cumule les 3 sources !
+    alertes = get_alim_confiance() + get_datatourisme() + get_open_agenda()
     
     envois = 0
     for a in alertes:
@@ -144,16 +145,14 @@ def job():
             envoyer_telegram(a)
             save_alert(a["id"], "Test_CE")
             envois += 1
-            time.sleep(3) # Anti-spam
+            time.sleep(3)
             
     logger.info(f"Scan terminé. {envois} alertes envoyées.")
 
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and CHAT_ID:
-        job() # Premier scan au démarrage
+        job()
         schedule.every(4).hours.do(job)
         while True:
             schedule.run_pending()
             time.sleep(60)
-    else:
-        logger.error("Variables TELEGRAM_TOKEN ou CHAT_ID manquantes !")
