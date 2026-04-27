@@ -1,1 +1,1 @@
-cezap_bot.py
+worker: python cezap_bot.py
