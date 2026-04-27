@@ -1,1 +1,1 @@
-worker: python ton_fichier.py
+cezap_bot.py
