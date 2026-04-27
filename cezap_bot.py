@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 
 # --- CONFIGURATION ---
-DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade" 
+DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DB_NAME = "cezap.db"
@@ -36,7 +36,7 @@ def is_new(item_id, client_nom):
 def save_alert(item_id, client_nom):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_alerts VALUES (?, ?, ?)", 
+    c.execute("INSERT OR IGNORE INTO sent_alerts VALUES (?, ?, ?)",
               (item_id, client_nom, datetime.now().isoformat()))
     conn.commit()
     conn.close()
@@ -45,20 +45,37 @@ def save_alert(item_id, client_nom):
 def get_alim_confiance(ville="Paris"):
     deals = []
     url = "https://dgal.opendatasoft.com/api/records/1.0/search/"
-    params = {"dataset": "export_alimconfiance", "q": ville, "rows": 5, "refine.synthese_eval_sanitaire": "Très satisfaisant"}
+    params = {
+        "dataset": "export_alimconfiance",
+        "q": ville,
+        "rows": 8,
+        "refine.synthese_eval_sanitaire": "Très satisfaisant"
+    }
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
-                nom = f.get("app_libelle_etablissement")
-                deal_id = "alim_" + hashlib.md5(f"{nom}".encode()).hexdigest()[:12]
+                nom = f.get("app_libelle_etablissement", "").strip()
+                # Filtre : ignorer les noms trop courts ou génériques
+                if not nom or len(nom) < 3 or nom.upper() in ["PARIS", "FRANCE", "IDF"]:
+                    continue
+                adresse = f.get("adresse_etablissement", "")
+                commune = f.get("libelle_commune", "")
+                lieu = f"{adresse}, {commune}".strip(", ")
+                deal_id = "alim_" + hashlib.md5(f"{nom}{adresse}".encode()).hexdigest()[:12]
                 deals.append({
-                    "id": deal_id, "titre": nom, "lieu": f.get("libelle_commune", ""),
-                    "categorie": "Restaurant (Hygiène Top ★★★)", "image": None,
-                    "url": f"https://www.google.com/search?q={nom}", "source": "Alim'confiance"
+                    "id": deal_id,
+                    "titre": nom.title(),
+                    "lieu": lieu,
+                    "categorie": "🍽️ Restaurant — Hygiène certifiée ★★★",
+                    "image": None,
+                    "url": f"https://www.google.com/search?q={nom.replace(' ', '+')}+{commune}+restaurant",
+                    "source": "Alim'confiance",
+                    "description": "Établissement avec une note hygiène TRÈS SATISFAISANTE selon les contrôles officiels."
                 })
-    except Exception as e: logger.error(f"Erreur Alim: {e}")
+    except Exception as e:
+        logger.error(f"Erreur Alim: {e}")
     return deals
 
 # --- SOURCE 2 : LOISIRS (DATAtourisme) ---
@@ -69,90 +86,219 @@ def get_datatourisme():
         if resp.status_code == 200:
             items = resp.json().get("@graph", [])
             for item in items[:10]:
-                nom = item.get("rdfs:label", {}).get("@value")
-                if not nom: continue
+                # Extraction du nom
+                label = item.get("rdfs:label", {})
+                if isinstance(label, dict):
+                    nom = label.get("@value", "")
+                elif isinstance(label, list):
+                    nom = label[0].get("@value", "") if label else ""
+                else:
+                    nom = str(label)
+
+                if not nom or len(nom) < 3:
+                    continue
+
+                # Extraction de la localisation — isLocatedAt est une liste
+                localisation = "Île-de-France"
+                is_located = item.get("isLocatedAt", [])
+                if isinstance(is_located, list) and is_located:
+                    address = is_located[0].get("schema:address", {})
+                    if isinstance(address, list) and address:
+                        address = address[0]
+                    if isinstance(address, dict):
+                        localisation = address.get("schema:addressLocality", "Île-de-France")
+                elif isinstance(is_located, dict):
+                    address = is_located.get("schema:address", {})
+                    if isinstance(address, dict):
+                        localisation = address.get("schema:addressLocality", "Île-de-France")
+
                 deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
                 deals.append({
-                    "id": deal_id, "titre": nom, 
-                    "lieu": item.get("isLocatedAt", [{}]).get("schema:address", [{}]).get("schema:addressLocality", "IDF"),
-                    "categorie": "Sortie & Loisirs", "image": None,
-                    "url": item.get("@id", "https://www.datatourisme.fr"), "source": "DATAtourisme"
+                    "id": deal_id,
+                    "titre": nom,
+                    "lieu": localisation,
+                    "categorie": "🎡 Sortie & Loisirs",
+                    "image": None,
+                    "url": item.get("@id", "https://www.datatourisme.fr"),
+                    "source": "DATAtourisme",
+                    "description": "Lieu de loisirs référencé par le Ministère du Tourisme français."
                 })
-    except Exception as e: logger.error(f"Erreur DATAtourisme: {e}")
+    except Exception as e:
+        logger.error(f"Erreur DATAtourisme: {e}")
     return deals
 
 # --- SOURCE 3 : EVENEMENTS (OpenAgenda) ---
 def get_open_agenda():
     deals = []
-    # Ici on utilise l'agenda "Sortir en Île-de-France" (UID: 89803504)
     url = "https://openagenda.com/agendas/89803504/events.json"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             events = resp.json().get("events", [])
-            for e in events[:5]:
-                nom = e.get("title", {}).get("fr")
-                deal_id = "open_" + str(e.get("uid"))
+            for e in events[:8]:
+                titre = e.get("title", {})
+                nom = titre.get("fr") or titre.get("en") if isinstance(titre, dict) else str(titre)
+                if not nom or len(nom) < 3:
+                    continue
+                lieu = e.get("locationName", "Île-de-France")
+                if isinstance(lieu, dict):
+                    lieu = lieu.get("fr", "Île-de-France")
+                deal_id = "open_" + str(e.get("uid", hashlib.md5(nom.encode()).hexdigest()[:8]))
                 deals.append({
                     "id": deal_id,
                     "titre": nom,
-                    "lieu": e.get("locationName", "IDF"),
-                    "categorie": "Événement / Expo",
+                    "lieu": lieu,
+                    "categorie": "📅 Événement / Expo",
                     "image": e.get("image"),
-                    "url": f"https://openagenda.com/event/{e.get('slug')}",
-                    "source": "OpenAgenda"
+                    "url": f"https://openagenda.com/event/{e.get('slug', '')}",
+                    "source": "OpenAgenda",
+                    "description": e.get("description", {}).get("fr", "") if isinstance(e.get("description"), dict) else ""
                 })
-    except Exception as e: logger.error(f"Erreur OpenAgenda: {e}")
+    except Exception as e:
+        logger.error(f"Erreur OpenAgenda: {e}")
+    return deals
+
+# --- SOURCE 4 : SPECTACLES (Que faire à Paris ?) ---
+def get_paris_events():
+    deals = []
+    url = "https://opendata.paris.fr/api/records/1.0/search/"
+    params = {
+        "dataset": "que-faire-a-paris-",
+        "rows": 8,
+        "sort": "date_start"
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            for r in resp.json().get("records", []):
+                f = r.get("fields", {})
+                nom = f.get("title", "").strip()
+                if not nom or len(nom) < 3:
+                    continue
+                adresse = f.get("address_name", "")
+                cp = f.get("address_zipcode", "")
+                lieu = f"{adresse} ({cp})".strip("( )") if adresse else f"Paris {cp}"
+                categorie_raw = f.get("category", "Sortie")
+                date_debut = f.get("date_start", "")
+                date_str = f" — {date_debut[:10]}" if date_debut else ""
+                deal_id = "paris_" + r.get("recordid", "")[:12]
+                deals.append({
+                    "id": deal_id,
+                    "titre": nom,
+                    "lieu": lieu,
+                    "categorie": f"🎭 {categorie_raw}{date_str}",
+                    "image": f.get("cover_url"),
+                    "url": f.get("url", "https://quefaire.paris.fr"),
+                    "source": "Que faire à Paris",
+                    "description": f.get("lead_text", "")
+                })
+    except Exception as e:
+        logger.error(f"Erreur Paris Events: {e}")
     return deals
 
 # --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
-    emojis = {"Alim'confiance": "🍴", "DATAtourisme": "🎡", "OpenAgenda": "📅"}
-    emoji = emojis.get(deal['source'], "✨")
-    
+    emojis = {
+        "Alim'confiance": "🍴",
+        "DATAtourisme": "🎡",
+        "OpenAgenda": "📅",
+        "Que faire à Paris": "🎭"
+    }
+    emoji = emojis.get(deal["source"], "✨")
+    description = deal.get("description", "")
+    desc_str = f"\n💬 _{description[:120]}..._\n" if description and len(description) > 10 else "\n"
+
     caption = (
         f"{emoji} *PROPOSITION CEZAP*\n\n"
         f"🎯 *{deal['titre']}*\n"
         f"📍 {deal['lieu']}\n"
-        f"📂 {deal['categorie']}\n\n"
+        f"📂 {deal['categorie']}\n"
+        f"{desc_str}\n"
         f"🔗 [Voir les détails]({deal['url']})"
     )
-    
+
     method = "sendPhoto" if deal.get("image") else "sendMessage"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown"}
-    
+    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown", "disable_web_page_preview": False}
+
     if deal.get("image"):
         payload["photo"] = deal["image"]
         payload["caption"] = caption
     else:
         payload["text"] = caption
-        
+
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e: logger.error(f"Erreur Telegram: {e}")
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logger.info(f"Envoye : {deal['titre']}")
+        else:
+            logger.error(f"Erreur Telegram {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.error(f"Erreur Telegram: {e}")
+
+# --- RESUME QUOTIDIEN 8H ---
+def envoyer_resume(alertes):
+    if not alertes:
+        return
+    top = alertes[:5]
+    lignes = []
+    for i, a in enumerate(top, 1):
+        lignes.append(f"{i}. *{a['titre']}* — {a['lieu']} ({a['source']})")
+    message = (
+        f"🌅 *Bonjour ! Les meilleures idées du jour pour votre CE*\n\n"
+        f"📅 {datetime.now().strftime('%A %d %B %Y')}\n\n"
+        + "\n".join(lignes) +
+        f"\n\n_Cezap — Votre CE toujours inspiré_ 🎉"
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }, timeout=10)
+        logger.info("Resume quotidien envoye !")
+    except Exception as e:
+        logger.error(f"Erreur resume: {e}")
 
 # --- JOB PRINCIPAL ---
-def job():
-    logger.info("Lancement du Scan Cezap...")
+def job(avec_resume=False):
+    logger.info("Lancement du scan Cezap...")
     init_db()
-    # On cumule les 3 sources !
-    alertes = get_alim_confiance() + get_datatourisme() + get_open_agenda()
-    
+
+    alertes = (
+        get_alim_confiance() +
+        get_datatourisme() +
+        get_open_agenda() +
+        get_paris_events()
+    )
+
+    if avec_resume:
+        envoyer_resume(alertes)
+
     envois = 0
     for a in alertes:
-        if is_new(a["id"], "Test_CE"):
+        if not a.get("titre") or len(a["titre"]) < 3:
+            continue
+        if is_new(a["id"], "Prod_CE"):
             envoyer_telegram(a)
-            save_alert(a["id"], "Test_CE")
+            save_alert(a["id"], "Prod_CE")
             envois += 1
-            time.sleep(3)
-            
-    logger.info(f"Scan terminé. {envois} alertes envoyées.")
+            time.sleep(2)
 
+    logger.info(f"Scan termine. {envois} alertes envoyees.")
+
+# --- MAIN ---
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and CHAT_ID:
-        job()
+        job(avec_resume=False)
+        # Resume quotidien a 8h
+        schedule.every().day.at("08:00").do(lambda: job(avec_resume=True))
+        # Scan toutes les 4h
         schedule.every(4).hours.do(job)
         while True:
             schedule.run_pending()
             time.sleep(60)
+    else:
+        logger.error("TELEGRAM_TOKEN ou CHAT_ID manquant !")
