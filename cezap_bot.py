@@ -25,7 +25,7 @@ def get_events(agenda_uid, ville):
             "key": OA_KEY,
             "size": 10,
             "lang": "fr",
-            "sort": "updatedAt.desc"
+            "relative[]": "upcoming"
         }
         resp = requests.get(url, params=params, timeout=15)
         logger.info(f"OpenAgenda {ville} ({agenda_uid}) -> {resp.status_code}")
@@ -52,13 +52,18 @@ def get_events(agenda_uid, ville):
                     image = img.get("base") or img.get("filename_url")
                 slug = e.get("slug", "")
                 uid = e.get("uid", "")
+                # URL correcte vers l'événement directement
+                if slug:
+                    url_event = f"https://openagenda.com/agendas/{agenda_uid}/events/{slug}"
+                else:
+                    url_event = f"https://openagenda.com/agendas/{agenda_uid}"
                 deals.append({
                     "id": f"oa_{agenda_uid}_{uid}",
                     "titre": titre,
                     "lieu": lieu or ville,
                     "description": description,
                     "image": image,
-                    "url": f"https://openagenda.com/{slug}" if slug else "https://openagenda.com",
+                    "url": url_event,
                     "source": ville
                 })
             except Exception as ex:
