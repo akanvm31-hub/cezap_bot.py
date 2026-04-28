@@ -5,6 +5,7 @@ import sqlite3
 import schedule
 import time
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -70,7 +71,6 @@ def get_sortiraparis():
             if resp.status_code != 200:
                 continue
             soup = BeautifulSoup(resp.text, "html.parser")
-            # Plusieurs sélecteurs possibles
             cards = soup.select("article[class*='item']") or \
                     soup.select("div[class*='item-list']") or \
                     soup.select("div[class*='card']") or \
@@ -79,50 +79,154 @@ def get_sortiraparis():
             logger.info(f"Sortiraparis {categorie} : {len(cards)} article(s)")
             for card in cards[:5]:
                 try:
-                    # Titre
                     titre_el = card.select_one("h2") or card.select_one("h3") or \
                                card.select_one("[class*='title']") or card.select_one("a")
                     titre = titre_el.get_text(strip=True) if titre_el else ""
                     if not titre or len(titre) < 5:
                         continue
-                    # URL
                     link_el = card.select_one("a[href*='sortiraparis']") or card.select_one("a")
                     href = link_el.get("href", "") if link_el else ""
                     url_deal = href if href.startswith("http") else "https://www.sortiraparis.com" + href
                     if not href:
                         continue
-                    # Image
                     img_el = card.select_one("img")
                     image = img_el.get("src") or img_el.get("data-src") if img_el else None
                     if image and not image.startswith("http"):
                         image = None
-                    # Description
                     desc_el = card.select_one("p") or card.select_one("[class*='desc']") or \
                               card.select_one("[class*='intro']")
                     description = desc_el.get_text(strip=True)[:150] if desc_el else ""
-                    # Lieu
                     lieu_el = card.select_one("[class*='location']") or card.select_one("[class*='lieu']") or \
                               card.select_one("[class*='address']")
                     lieu = lieu_el.get_text(strip=True) if lieu_el else "Paris"
                     deal_id = "sap_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
                     deals.append({
-                        "id": deal_id,
-                        "titre": titre,
-                        "lieu": lieu or "Paris",
-                        "categorie": categorie,
-                        "image": image,
-                        "url": url_deal,
-                        "source": "Sortiraparis",
-                        "description": description
+                        "id": deal_id, "titre": titre, "lieu": lieu or "Paris",
+                        "categorie": categorie, "image": image, "url": url_deal,
+                        "source": "Sortiraparis", "description": description
                     })
                 except:
                     continue
-            time.sleep(1)  # Pause entre chaque catégorie
+            time.sleep(1)
         except Exception as e:
             logger.error(f"Erreur Sortiraparis {categorie}: {e}")
     return deals
 
-# --- SOURCE 2 : OPENAGENDA ---
+# --- SOURCE 2 : AGENDA CULTUREL (RSS national) ---
+def get_agenda_culturel():
+    deals = []
+    # Flux RSS nationaux par catégorie
+    flux_rss = [
+        ("https://www.agendaculturel.fr/rss/concert/", "🎵 Concert"),
+        ("https://www.agendaculturel.fr/rss/theatre/", "🎭 Théâtre"),
+        ("https://www.agendaculturel.fr/rss/exposition/", "🎨 Exposition"),
+        ("https://www.agendaculturel.fr/rss/festival/", "🎪 Festival"),
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml",
+    }
+    for url, categorie in flux_rss:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            logger.info(f"AgendaCulturel {categorie} status : {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            logger.info(f"AgendaCulturel {categorie} : {len(items)} item(s)")
+            for item in items[:5]:
+                try:
+                    titre = item.findtext("title", "").strip()
+                    if not titre or len(titre) < 3:
+                        continue
+                    url_deal = item.findtext("link", "").strip()
+                    if not url_deal:
+                        continue
+                    description = item.findtext("description", "").strip()
+                    # Nettoyer le HTML dans la description
+                    if description:
+                        desc_soup = BeautifulSoup(description, "html.parser")
+                        description = desc_soup.get_text(strip=True)[:150]
+                    # Lieu depuis le titre ou description
+                    lieu = "France"
+                    pub_date = item.findtext("pubDate", "")
+                    deal_id = "ac_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    deals.append({
+                        "id": deal_id,
+                        "titre": titre,
+                        "lieu": lieu,
+                        "categorie": categorie,
+                        "image": None,
+                        "url": url_deal,
+                        "source": "AgendaCulturel",
+                        "description": description
+                    })
+                except:
+                    continue
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Erreur AgendaCulturel {categorie}: {e}")
+    return deals
+
+# --- SOURCE 3 : SORTIRAUJOURDHUI (RSS national) ---
+def get_sortiraujourdhui():
+    deals = []
+    flux_rss = [
+        ("https://www.sortiraujourdhui.fr/rss/concert", "🎵 Concert"),
+        ("https://www.sortiraujourdhui.fr/rss/spectacle", "🎭 Spectacle"),
+        ("https://www.sortiraujourdhui.fr/rss/exposition", "🎨 Exposition"),
+        ("https://www.sortiraujourdhui.fr/rss/famille", "👨‍👩‍👧 Famille"),
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml",
+    }
+    for url, categorie in flux_rss:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            logger.info(f"Sortiraujourdhui {categorie} status : {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            logger.info(f"Sortiraujourdhui {categorie} : {len(items)} item(s)")
+            for item in items[:5]:
+                try:
+                    titre = item.findtext("title", "").strip()
+                    if not titre or len(titre) < 3:
+                        continue
+                    url_deal = item.findtext("link", "").strip()
+                    if not url_deal:
+                        continue
+                    description = item.findtext("description", "").strip()
+                    if description:
+                        desc_soup = BeautifulSoup(description, "html.parser")
+                        description = desc_soup.get_text(strip=True)[:150]
+                    # Extraire image depuis contenu RSS
+                    image = None
+                    enclosure = item.find("enclosure")
+                    if enclosure is not None:
+                        image = enclosure.get("url")
+                    deal_id = "saj_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    deals.append({
+                        "id": deal_id,
+                        "titre": titre,
+                        "lieu": "France",
+                        "categorie": categorie,
+                        "image": image,
+                        "url": url_deal,
+                        "source": "Sortiraujourdhui",
+                        "description": description
+                    })
+                except:
+                    continue
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Erreur Sortiraujourdhui {categorie}: {e}")
+    return deals
+
+# --- SOURCE 4 : OPENAGENDA ---
 def get_open_agenda():
     deals = []
     url = "https://openagenda.com/agendas/89803504/events.json"
@@ -140,9 +244,7 @@ def get_open_agenda():
                     lieu = lieu.get("fr", "Île-de-France")
                 deal_id = "open_" + str(e.get("uid", hashlib.md5(nom.encode()).hexdigest()[:8]))
                 deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": lieu,
+                    "id": deal_id, "titre": nom, "lieu": lieu,
                     "categorie": "📅 Événement / Expo",
                     "image": e.get("image"),
                     "url": f"https://openagenda.com/event/{e.get('slug', '')}",
@@ -153,15 +255,11 @@ def get_open_agenda():
         logger.error(f"Erreur OpenAgenda: {e}")
     return deals
 
-# --- SOURCE 3 : QUE FAIRE A PARIS ---
+# --- SOURCE 5 : QUE FAIRE A PARIS ---
 def get_paris_events():
     deals = []
     url = "https://opendata.paris.fr/api/records/1.0/search/"
-    params = {
-        "dataset": "que-faire-a-paris-",
-        "rows": 8,
-        "sort": "date_start"
-    }
+    params = {"dataset": "que-faire-a-paris-", "rows": 8, "sort": "date_start"}
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
@@ -178,9 +276,7 @@ def get_paris_events():
                 date_str = f" — {date_debut[:10]}" if date_debut else ""
                 deal_id = "paris_" + r.get("recordid", "")[:12]
                 deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": lieu,
+                    "id": deal_id, "titre": nom, "lieu": lieu,
                     "categorie": f"🎭 {categorie_raw}{date_str}",
                     "image": f.get("cover_url"),
                     "url": f.get("url", "https://quefaire.paris.fr"),
@@ -191,7 +287,7 @@ def get_paris_events():
         logger.error(f"Erreur Paris Events: {e}")
     return deals
 
-# --- SOURCE 4 : DATATOURISME ---
+# --- SOURCE 6 : DATATOURISME ---
 def get_datatourisme():
     deals = []
     try:
@@ -222,11 +318,8 @@ def get_datatourisme():
                         localisation = address.get("schema:addressLocality", "Île-de-France")
                 deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
                 deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": localisation,
-                    "categorie": "🎡 Sortie & Loisirs",
-                    "image": None,
+                    "id": deal_id, "titre": nom, "lieu": localisation,
+                    "categorie": "🎡 Sortie & Loisirs", "image": None,
                     "url": item.get("@id", "https://www.datatourisme.fr"),
                     "source": "DATAtourisme",
                     "description": "Lieu de loisirs référencé par le Ministère du Tourisme français."
@@ -235,7 +328,7 @@ def get_datatourisme():
         logger.error(f"Erreur DATAtourisme: {e}")
     return deals
 
-# --- SOURCE 5 : BILLETREDUC ---
+# --- SOURCE 7 : BILLETREDUC ---
 def get_billetreduc(ville="Paris"):
     deals = []
     try:
@@ -265,134 +358,4 @@ def get_billetreduc(ville="Paris"):
                     prix_txt = prix_el.get_text(strip=True) if prix_el else ""
                     prix = int("".join(filter(str.isdigit, prix_txt.split("€")[0].replace(" ", "")))) if "€" in prix_txt else 0
                     reduction_el = card.select_one("[class*='reduc']") or card.select_one("[class*='discount']")
-                    reduction_txt = reduction_el.get_text(strip=True) if reduction_el else ""
-                    reduction = int("".join(filter(str.isdigit, reduction_txt))) if any(c.isdigit() for c in reduction_txt) else 0
-                    desc = f"À partir de {prix}€" if prix > 0 else ""
-                    if reduction > 0:
-                        desc += f" — -{reduction}% de réduction"
-                    deal_id = "br_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
-                    deals.append({
-                        "id": deal_id,
-                        "titre": titre,
-                        "lieu": ville,
-                        "categorie": "🎟️ Spectacle — Billet réduit",
-                        "image": None,
-                        "url": url_deal,
-                        "source": "BilletReduc",
-                        "description": desc
-                    })
-                except:
-                    continue
-    except Exception as e:
-        logger.error(f"Erreur BilletReduc: {e}")
-    return deals
-
-# --- ENVOI TELEGRAM ---
-def envoyer_telegram(deal):
-    emojis = {
-        "Sortiraparis": "✨",
-        "OpenAgenda": "📅",
-        "Que faire à Paris": "🎭",
-        "DATAtourisme": "🎡",
-        "BilletReduc": "🎟️"
-    }
-    emoji = emojis.get(deal["source"], "✨")
-    description = deal.get("description", "")
-    desc_str = f"\n💬 _{description[:120]}..._\n" if description and len(description) > 10 else "\n"
-
-    caption = (
-        f"{emoji} *PROPOSITION CEZAP*\n\n"
-        f"🎯 *{deal['titre']}*\n"
-        f"📍 {deal['lieu']}\n"
-        f"📂 {deal['categorie']}\n"
-        f"{desc_str}\n"
-        f"🔗 [Voir les détails]({deal['url']})"
-    )
-
-    method = "sendPhoto" if deal.get("image") else "sendMessage"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown", "disable_web_page_preview": False}
-
-    if deal.get("image"):
-        payload["photo"] = deal["image"]
-        payload["caption"] = caption
-    else:
-        payload["text"] = caption
-
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            logger.info(f"Envoye : {deal['titre']}")
-        else:
-            logger.error(f"Erreur Telegram {resp.status_code}: {resp.text[:100]}")
-    except Exception as e:
-        logger.error(f"Erreur Telegram: {e}")
-
-# --- RESUME QUOTIDIEN 8H ---
-def envoyer_resume(alertes):
-    if not alertes:
-        return
-    top = alertes[:5]
-    lignes = []
-    for i, a in enumerate(top, 1):
-        lignes.append(f"{i}. *{a['titre']}* — {a['lieu']} ({a['source']})")
-    message = (
-        f"🌅 *Bonjour ! Les meilleures idées du jour pour votre CE*\n\n"
-        f"📅 {datetime.now().strftime('%A %d %B %Y')}\n\n"
-        + "\n".join(lignes) +
-        f"\n\n_Cezap — Votre CE toujours inspiré_ 🎉"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }, timeout=10)
-        logger.info("Resume quotidien envoye !")
-    except Exception as e:
-        logger.error(f"Erreur resume: {e}")
-
-# --- JOB PRINCIPAL ---
-def job(avec_resume=False):
-    logger.info("Lancement du scan Cezap...")
-    init_db()
-
-    if avec_resume:
-        vider_cache()
-
-    alertes = (
-        get_sortiraparis() +
-        get_open_agenda() +
-        get_paris_events() +
-        get_datatourisme() +
-        get_billetreduc()
-    )
-
-    if avec_resume:
-        envoyer_resume(alertes)
-
-    envois = 0
-    for a in alertes:
-        if not a.get("titre") or len(a["titre"]) < 5:
-            continue
-        if is_new(a["id"], "Prod_CE"):
-            envoyer_telegram(a)
-            save_alert(a["id"], "Prod_CE")
-            envois += 1
-            time.sleep(2)
-
-    logger.info(f"Scan termine. {envois} alertes envoyees.")
-
-# --- MAIN ---
-if __name__ == "__main__":
-    if TELEGRAM_TOKEN and CHAT_ID:
-        job(avec_resume=False)
-        schedule.every().day.at("08:00").do(lambda: job(avec_resume=True))
-        schedule.every(4).hours.do(job)
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-    else:
-        logger.error("TELEGRAM_TOKEN ou CHAT_ID manquant !")
+                    reduction_txt = reduction_el.get_text(strip=True) if reduction_
