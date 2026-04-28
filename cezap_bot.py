@@ -58,7 +58,8 @@ def get_events(agenda_uid, ville):
                     "lieu": lieu or ville,
                     "description": description,
                     "image": image,
-                    "url": f"https://openagenda.com/agendas/{agenda_uid}/events/{slug}" if slug else "https://openagenda.com",
+                    "url": f"https://openagenda.com/{slug}" if slug else "https://openagenda.com",
+,
                     "source": ville
                 })
             except Exception as ex:
