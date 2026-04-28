@@ -42,14 +42,44 @@ def save_alert(item_id, client_nom):
     conn.commit()
     conn.close()
 
+def vider_cache():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("DELETE FROM sent_alerts")
+    conn.commit()
+    conn.close()
+    logger.info("Cache vide !")
+
 # --- SOURCE 1 : RESTAURATION (Alim'confiance) ---
+# Mots clés qui indiquent un vrai restaurant
+MOTS_RESTAURANT = [
+    "restaurant", "brasserie", "bistrot", "bistro", "café", "cafe",
+    "pizzeria", "sushi", "japonais", "italien", "chinois", "thaï",
+    "thai", "indien", "libanais", "marocain", "mexicain", "grec",
+    "traiteur", "gastronomie", "gastronomique", "brasier", "taverne",
+    "auberge", "hostellerie", "grill", "steakhouse", "crêperie",
+    "creperie", "bouchon", "estaminet", "wok", "ramen", "burger",
+    "cantine", "buffet", "bistronomie", "table", "chez "
+]
+
+# Mots clés qui indiquent ce qu'on veut EXCLURE
+MOTS_EXCLUSION = [
+    "boucherie", "charcuterie", "supermarche", "supermarché",
+    "hypermarche", "hypermarché", "epicerie", "épicerie",
+    "boulangerie", "patisserie", "pâtisserie", "confiserie",
+    "poissonerie", "poissonnerie", "fromagerie", "cave",
+    "primeur", "fruits", "legumes", "légumes", "alimentation",
+    "generale", "générale", "station", "snack", "sandwicherie",
+    "kebab", "fast food", "fastfood", "vente", "distribution",
+    "grossiste", "centrale", "entrepot", "entrepôt"
+]
+
 def get_alim_confiance(ville="Paris"):
     deals = []
     url = "https://dgal.opendatasoft.com/api/records/1.0/search/"
     params = {
         "dataset": "export_alimconfiance",
         "q": ville,
-        "rows": 8,
+        "rows": 20,  # On prend plus pour avoir assez après filtrage
         "refine.synthese_eval_sanitaire": "Très satisfaisant"
     }
     try:
@@ -60,6 +90,25 @@ def get_alim_confiance(ville="Paris"):
                 nom = f.get("app_libelle_etablissement", "").strip()
                 if not nom or len(nom) < 3 or nom.upper() in ["PARIS", "FRANCE", "IDF"]:
                     continue
+
+                nom_lower = nom.lower()
+                activite = f.get("libelle_activite_etablissement", "").lower()
+                texte_complet = f"{nom_lower} {activite}"
+
+                # Exclure les établissements non-restaurant
+                if any(mot in texte_complet for mot in MOTS_EXCLUSION):
+                    continue
+
+                # Garder uniquement les vrais restaurants
+                est_restaurant = any(mot in texte_complet for mot in MOTS_RESTAURANT)
+
+                # Si activité contient "restaurant" explicitement c'est bon
+                if "restaur" in activite:
+                    est_restaurant = True
+
+                if not est_restaurant:
+                    continue
+
                 adresse = f.get("adresse_etablissement", "")
                 commune = f.get("libelle_commune", "")
                 lieu = f"{adresse}, {commune}".strip(", ")
@@ -72,8 +121,12 @@ def get_alim_confiance(ville="Paris"):
                     "image": None,
                     "url": f"https://www.google.com/search?q={nom.replace(' ', '+')}+{commune}+restaurant",
                     "source": "Alim'confiance",
-                    "description": "Établissement avec une note hygiène TRÈS SATISFAISANTE selon les contrôles officiels."
+                    "description": "Restaurant avec une note hygiène TRÈS SATISFAISANTE selon les contrôles officiels."
                 })
+
+                if len(deals) >= 5:  # Max 5 restaurants par scan
+                    break
+
     except Exception as e:
         logger.error(f"Erreur Alim: {e}")
     return deals
@@ -314,6 +367,10 @@ def envoyer_resume(alertes):
 def job(avec_resume=False):
     logger.info("Lancement du scan Cezap...")
     init_db()
+
+    # Vider le cache au résumé quotidien
+    if avec_resume:
+        vider_cache()
 
     alertes = (
         get_alim_confiance() +
