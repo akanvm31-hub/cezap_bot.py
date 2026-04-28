@@ -5,12 +5,9 @@ import sqlite3
 import schedule
 import time
 import logging
-import feedparser  # Assure-toi de l'avoir dans ton requirements.txt
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-# --- CONFIGURATION ---
-DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DB_NAME = "cezap.db"
@@ -18,7 +15,6 @@ DB_NAME = "cezap.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- BASE DE DONNÉES ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -43,141 +39,239 @@ def save_alert(item_id, client_nom):
     conn.commit()
     conn.close()
 
-# --- SOURCE 1 : SORTIR À PARIS (RSS - TRÈS STABLE) ---
-def get_sortiraparis():
-    deals = []
-    rss_url = "https://www.sortiraparis.com/rss.xml"
-    try:
-        feed = feedparser.parse(rss_url)
-        logger.info(f"Sortir à Paris : {len(feed.entries)} articles")
-        for entry in feed.entries[:10]:
-            deal_id = "sap_" + hashlib.md5(entry.link.encode()).hexdigest()[:12]
-            # Extraction image si dispo
-            image = None
-            if 'media_content' in entry:
-                image = entry.media_content['url']
-            
-            deals.append({
-                "id": deal_id,
-                "titre": entry.title,
-                "lieu": "Île-de-France",
-                "categorie": "🌟 Culture & Sorties",
-                "image": image,
-                "url": entry.link,
-                "source": "Sortir à Paris",
-                "description": entry.summary[:150] + "..." if 'summary' in entry else ""
-            })
-    except Exception as e:
-        logger.error(f"Erreur RSS Sortir à Paris: {e}")
-    return deals
+def vider_cache():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("DELETE FROM sent_alerts")
+    conn.commit()
+    conn.close()
+    logger.info("Cache vide !")
 
-# --- SOURCE 2 : BILLETREDUC (PROMOS) ---
-def get_billetreduc(ville="Paris"):
+# ══════════════════════════════════════════════
+# SOURCE PRINCIPALE : OpenAgenda multi-agendas
+# ══════════════════════════════════════════════
+AGENDAS = [
+    ("89803504", "Ile-de-France"),      # Sortir en IDF
+    ("55980392", "Paris"),               # Que faire a Paris
+    ("52357978", "Lyon"),                # Agenda Lyon
+    ("83192274", "Marseille"),           # Agenda Marseille
+    ("19291915", "Bordeaux"),            # Agenda Bordeaux
+    ("74836251", "Toulouse"),            # Agenda Toulouse
+    ("48984891", "Nantes"),              # Agenda Nantes
+    ("29312421", "France Culture"),      # Culture France
+]
+
+def get_openagenda_multi():
     deals = []
-    try:
-        url = f"https://www.billetreduc.com/paris/liste.htm"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Ciblage plus robuste
-            cards = soup.select(".lelt") or soup.select("table[class*='lelt']")
-            for card in cards[:6]:
+    for agenda_id, ville in AGENDAS:
+        try:
+            url = f"https://openagenda.com/agendas/{agenda_id}/events.json"
+            resp = requests.get(url, timeout=10)
+            logger.info(f"OpenAgenda {ville} ({agenda_id}) status : {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+            events = resp.json().get("events", [])
+            logger.info(f"OpenAgenda {ville} : {len(events)} evenement(s)")
+            for e in events[:5]:
                 try:
-                    link_el = card.find("a", class_="bold")
-                    if not link_el: continue
-                    titre = link_el.get_text(strip=True)
-                    url_deal = "https://www.billetreduc.com" + link_el['href']
-                    
-                    deal_id = "br_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    titre_raw = e.get("title", {})
+                    nom = titre_raw.get("fr") or titre_raw.get("en") if isinstance(titre_raw, dict) else str(titre_raw)
+                    if not nom or len(nom) < 3:
+                        continue
+                    lieu_raw = e.get("locationName", ville)
+                    lieu = lieu_raw.get("fr", ville) if isinstance(lieu_raw, dict) else str(lieu_raw)
+                    desc_raw = e.get("description", {})
+                    description = ""
+                    if isinstance(desc_raw, dict):
+                        description = desc_raw.get("fr", "")[:150]
+                    image = e.get("image")
+                    slug = e.get("slug", "")
+                    uid = e.get("uid", "")
+                    deal_id = f"oa_{agenda_id}_{uid}"
                     deals.append({
-                        "id": deal_id, "titre": titre, "lieu": ville,
-                        "categorie": "🎟️ Promo Spectacle", "image": None,
-                        "url": url_deal, "source": "BilletReduc", 
-                        "description": "Profitez de tarifs réduits sur BilletReduc."
+                        "id": deal_id,
+                        "titre": nom,
+                        "lieu": lieu or ville,
+                        "categorie": "📅 Evenement culturel",
+                        "image": image,
+                        "url": f"https://openagenda.com/event/{slug}" if slug else f"https://openagenda.com",
+                        "source": f"OpenAgenda {ville}",
+                        "description": description
                     })
-                except: continue
-    except Exception as e:
-        logger.error(f"Erreur BilletReduc: {e}")
+                except:
+                    continue
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Erreur OpenAgenda {ville}: {e}")
     return deals
 
-# --- SOURCE 3 : QUE FAIRE À PARIS (OPEN DATA) ---
+# ══════════════════════════════════════════════
+# SOURCE 2 : Que faire a Paris (API officielle)
+# ══════════════════════════════════════════════
 def get_paris_events():
     deals = []
     url = "https://opendata.paris.fr/api/records/1.0/search/"
-    params = {"dataset": "que-faire-a-paris-", "rows": 5, "sort": "date_start"}
+    params = {"dataset": "que-faire-a-paris-", "rows": 10, "sort": "date_start"}
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
+                nom = f.get("title", "").strip()
+                if not nom or len(nom) < 3:
+                    continue
+                adresse = f.get("address_name", "")
+                cp = f.get("address_zipcode", "")
+                lieu = f"{adresse} ({cp})".strip("( )") if adresse else f"Paris {cp}"
+                categorie_raw = f.get("category", "Sortie")
+                date_debut = f.get("date_start", "")
+                date_str = f" - {date_debut[:10]}" if date_debut else ""
                 deal_id = "paris_" + r.get("recordid", "")[:12]
                 deals.append({
-                    "id": deal_id, "titre": f.get("title", ""), 
-                    "lieu": f"Paris ({f.get('address_zipcode', '')})",
-                    "categorie": f"🎭 {f.get('category', 'Événement')}",
+                    "id": deal_id, "titre": nom, "lieu": lieu,
+                    "categorie": f"🎭 {categorie_raw}{date_str}",
                     "image": f.get("cover_url"),
                     "url": f.get("url", "https://quefaire.paris.fr"),
-                    "source": "Que faire à Paris",
-                    "description": f.get("lead_text", "")[:150]
+                    "source": "Que faire a Paris",
+                    "description": f.get("lead_text", "")
                 })
     except Exception as e:
         logger.error(f"Erreur Paris Events: {e}")
     return deals
 
-# --- ENVOI TELEGRAM ---
+# ══════════════════════════════════════════════
+# SOURCE 3 : DATAtourisme
+# ══════════════════════════════════════════════
+DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade"
+
+def get_datatourisme():
+    deals = []
+    try:
+        resp = requests.get(DATATOURISME_FLUX_URL, timeout=15)
+        if resp.status_code == 200:
+            items = resp.json().get("@graph", [])
+            for item in items[:10]:
+                label = item.get("rdfs:label", {})
+                if isinstance(label, dict):
+                    nom = label.get("@value", "")
+                elif isinstance(label, list):
+                    nom = label[0].get("@value", "") if label else ""
+                else:
+                    nom = str(label)
+                if not nom or len(nom) < 3:
+                    continue
+                localisation = "Ile-de-France"
+                is_located = item.get("isLocatedAt", [])
+                if isinstance(is_located, list) and is_located:
+                    address = is_located[0].get("schema:address", {})
+                    if isinstance(address, list) and address:
+                        address = address[0]
+                    if isinstance(address, dict):
+                        localisation = address.get("schema:addressLocality", "Ile-de-France")
+                elif isinstance(is_located, dict):
+                    address = is_located.get("schema:address", {})
+                    if isinstance(address, dict):
+                        localisation = address.get("schema:addressLocality", "Ile-de-France")
+                deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
+                deals.append({
+                    "id": deal_id, "titre": nom, "lieu": localisation,
+                    "categorie": "🎡 Sortie & Loisirs", "image": None,
+                    "url": item.get("@id", "https://www.datatourisme.fr"),
+                    "source": "DATAtourisme",
+                    "description": "Lieu de loisirs reference par le Ministere du Tourisme."
+                })
+    except Exception as e:
+        logger.error(f"Erreur DATAtourisme: {e}")
+    return deals
+
+# ══════════════════════════════════════════════
+# ENVOI TELEGRAM
+# ══════════════════════════════════════════════
 def envoyer_telegram(deal):
-    emojis = {"Sortir à Paris": "🌟", "BilletReduc": "🎟️", "Que faire à Paris": "🎭"}
-    emoji = emojis.get(deal["source"], "✨")
-    
+    emoji = "📅" if "OpenAgenda" in deal["source"] else "🎭" if "Paris" in deal["source"] else "🎡"
+    description = deal.get("description", "")
+    desc_str = f"\n💬 _{description[:120]}..._\n" if description and len(description) > 10 else "\n"
     caption = (
         f"{emoji} *PROPOSITION CEZAP*\n\n"
         f"🎯 *{deal['titre']}*\n"
         f"📍 {deal['lieu']}\n"
-        f"📂 {deal['categorie']}\n\n"
-        f"💬 _{deal['description']}_\n\n"
-        f"🔗 [Voir les détails]({deal['url']})"
+        f"📂 {deal['categorie']}\n"
+        f"{desc_str}\n"
+        f"🔗 [Voir les details]({deal['url']})"
     )
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     method = "sendPhoto" if deal.get("image") else "sendMessage"
-    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown"}
-    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown", "disable_web_page_preview": False}
     if deal.get("image"):
         payload["photo"] = deal["image"]
         payload["caption"] = caption
     else:
         payload["text"] = caption
-
     try:
-        requests.post(url + method, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logger.info(f"Envoye : {deal['titre']}")
+        else:
+            logger.error(f"Erreur Telegram {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        logger.error(f"Erreur envoi Telegram: {e}")
+        logger.error(f"Erreur Telegram: {e}")
 
-# --- JOB PRINCIPAL ---
+def envoyer_resume(alertes):
+    if not alertes:
+        return
+    top = alertes[:5]
+    lignes = []
+    for i, a in enumerate(top, 1):
+        lignes.append(f"{i}. *{a['titre']}* - {a['lieu']} ({a['source']})")
+    message = (
+        f"🌅 *Bonjour ! Les meilleures idees du jour pour votre CE*\n\n"
+        f"📅 {datetime.now().strftime('%A %d %B %Y')}\n\n"
+        + "\n".join(lignes) +
+        f"\n\n_Cezap - Votre CE toujours inspire_ 🎉"
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": CHAT_ID, "text": message,
+            "parse_mode": "Markdown", "disable_web_page_preview": True
+        }, timeout=10)
+        logger.info("Resume quotidien envoye !")
+    except Exception as e:
+        logger.error(f"Erreur resume: {e}")
+
+# ══════════════════════════════════════════════
+# JOB PRINCIPAL
+# ══════════════════════════════════════════════
 def job(avec_resume=False):
-    logger.info("Scan en cours...")
+    logger.info("Lancement du scan Cezap...")
     init_db()
-    
-    # On rassemble toutes les sources
-    alertes = get_sortiraparis() + get_paris_events() + get_billetreduc()
-    
+    if avec_resume:
+        vider_cache()
+    alertes = (
+        get_openagenda_multi() +
+        get_paris_events() +
+        get_datatourisme()
+    )
+    logger.info(f"Total alertes collectees : {len(alertes)}")
+    if avec_resume:
+        envoyer_resume(alertes)
     envois = 0
     for a in alertes:
+        if not a.get("titre") or len(a["titre"]) < 5:
+            continue
         if is_new(a["id"], "Prod_CE"):
             envoyer_telegram(a)
             save_alert(a["id"], "Prod_CE")
             envois += 1
             time.sleep(2)
-    logger.info(f"Scan terminé. {envois} nouvelles alertes.")
+    logger.info(f"Scan termine. {envois} alertes envoyees.")
 
-# --- LANCEMENT ---
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and CHAT_ID:
-        job() # Premier lancement
+        job(avec_resume=False)
+        schedule.every().day.at("08:00").do(lambda: job(avec_resume=True))
         schedule.every(4).hours.do(job)
         while True:
             schedule.run_pending()
             time.sleep(60)
     else:
-        logger.error("Variables d'environnement manquantes !")
+        logger.error("TELEGRAM_TOKEN ou CHAT_ID manquant !")
