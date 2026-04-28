@@ -5,7 +5,7 @@ import sqlite3
 import schedule
 import time
 import logging
-import xml.etree.ElementTree as ET
+import feedparser  # Assure-toi de l'avoir dans ton requirements.txt
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -18,6 +18,7 @@ DB_NAME = "cezap.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- BASE DE DONNÉES ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -42,412 +43,141 @@ def save_alert(item_id, client_nom):
     conn.commit()
     conn.close()
 
-def vider_cache():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("DELETE FROM sent_alerts")
-    conn.commit()
-    conn.close()
-    logger.info("Cache vide !")
-
+# --- SOURCE 1 : SORTIR À PARIS (RSS - TRÈS STABLE) ---
 def get_sortiraparis():
     deals = []
-    categories = [
-        ("https://www.sortiraparis.com/loisirs/spectacle", "🎭 Spectacle"),
-        ("https://www.sortiraparis.com/restaurants", "🍽️ Restaurant"),
-        ("https://www.sortiraparis.com/arts-culture/exposition", "🎨 Exposition"),
-        ("https://www.sortiraparis.com/loisirs", "🎡 Loisirs"),
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    for url, categorie in categories:
-        try:
-            resp = requests.get(url, headers=headers, timeout=20)
-            logger.info(f"Sortiraparis {categorie} status : {resp.status_code}")
-            if resp.status_code != 200:
-                continue
-            soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.select("article[class*='item']") or \
-                    soup.select("div[class*='item-list']") or \
-                    soup.select("div[class*='card']") or \
-                    soup.select("article") or \
-                    soup.select("li[class*='item']")
-            logger.info(f"Sortiraparis {categorie} : {len(cards)} article(s)")
-            for card in cards[:5]:
-                try:
-                    titre_el = card.select_one("h2") or card.select_one("h3") or \
-                               card.select_one("[class*='title']") or card.select_one("a")
-                    titre = titre_el.get_text(strip=True) if titre_el else ""
-                    if not titre or len(titre) < 5:
-                        continue
-                    link_el = card.select_one("a[href*='sortiraparis']") or card.select_one("a")
-                    href = link_el.get("href", "") if link_el else ""
-                    url_deal = href if href.startswith("http") else "https://www.sortiraparis.com" + href
-                    if not href:
-                        continue
-                    img_el = card.select_one("img")
-                    image = img_el.get("src") or img_el.get("data-src") if img_el else None
-                    if image and not image.startswith("http"):
-                        image = None
-                    desc_el = card.select_one("p") or card.select_one("[class*='desc']") or \
-                              card.select_one("[class*='intro']")
-                    description = desc_el.get_text(strip=True)[:150] if desc_el else ""
-                    lieu_el = card.select_one("[class*='location']") or card.select_one("[class*='lieu']") or \
-                              card.select_one("[class*='address']")
-                    lieu = lieu_el.get_text(strip=True) if lieu_el else "Paris"
-                    deal_id = "sap_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
-                    deals.append({
-                        "id": deal_id, "titre": titre, "lieu": lieu or "Paris",
-                        "categorie": categorie, "image": image, "url": url_deal,
-                        "source": "Sortiraparis", "description": description
-                    })
-                except:
-                    continue
-            time.sleep(1)
-        except Exception as e:
-            logger.error(f"Erreur Sortiraparis {categorie}: {e}")
-    return deals
-
-def get_agenda_culturel():
-    deals = []
-    flux_rss = [
-        ("https://www.agendaculturel.fr/rss/concert/", "🎵 Concert"),
-        ("https://www.agendaculturel.fr/rss/theatre/", "🎭 Theatre"),
-        ("https://www.agendaculturel.fr/rss/exposition/", "🎨 Exposition"),
-        ("https://www.agendaculturel.fr/rss/festival/", "🎪 Festival"),
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/rss+xml, application/xml, text/xml",
-    }
-    for url, categorie in flux_rss:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            logger.info(f"AgendaCulturel {categorie} status : {resp.status_code}")
-            if resp.status_code != 200:
-                continue
-            root = ET.fromstring(resp.content)
-            items = root.findall(".//item")
-            logger.info(f"AgendaCulturel {categorie} : {len(items)} item(s)")
-            for item in items[:5]:
-                try:
-                    titre = item.findtext("title", "").strip()
-                    if not titre or len(titre) < 3:
-                        continue
-                    url_deal = item.findtext("link", "").strip()
-                    if not url_deal:
-                        continue
-                    description = item.findtext("description", "").strip()
-                    if description:
-                        desc_soup = BeautifulSoup(description, "html.parser")
-                        description = desc_soup.get_text(strip=True)[:150]
-                    deal_id = "ac_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
-                    deals.append({
-                        "id": deal_id, "titre": titre, "lieu": "France",
-                        "categorie": categorie, "image": None, "url": url_deal,
-                        "source": "AgendaCulturel", "description": description
-                    })
-                except:
-                    continue
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Erreur AgendaCulturel {categorie}: {e}")
-    return deals
-
-def get_sortiraujourdhui():
-    deals = []
-    flux_rss = [
-        ("https://www.sortiraujourdhui.fr/rss/concert", "🎵 Concert"),
-        ("https://www.sortiraujourdhui.fr/rss/spectacle", "🎭 Spectacle"),
-        ("https://www.sortiraujourdhui.fr/rss/exposition", "🎨 Exposition"),
-        ("https://www.sortiraujourdhui.fr/rss/famille", "👨‍👩‍👧 Famille"),
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/rss+xml, application/xml, text/xml",
-    }
-    for url, categorie in flux_rss:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            logger.info(f"Sortiraujourdhui {categorie} status : {resp.status_code}")
-            if resp.status_code != 200:
-                continue
-            root = ET.fromstring(resp.content)
-            items = root.findall(".//item")
-            logger.info(f"Sortiraujourdhui {categorie} : {len(items)} item(s)")
-            for item in items[:5]:
-                try:
-                    titre = item.findtext("title", "").strip()
-                    if not titre or len(titre) < 3:
-                        continue
-                    url_deal = item.findtext("link", "").strip()
-                    if not url_deal:
-                        continue
-                    description = item.findtext("description", "").strip()
-                    if description:
-                        desc_soup = BeautifulSoup(description, "html.parser")
-                        description = desc_soup.get_text(strip=True)[:150]
-                    image = None
-                    enclosure = item.find("enclosure")
-                    if enclosure is not None:
-                        image = enclosure.get("url")
-                    deal_id = "saj_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
-                    deals.append({
-                        "id": deal_id, "titre": titre, "lieu": "France",
-                        "categorie": categorie, "image": image, "url": url_deal,
-                        "source": "Sortiraujourdhui", "description": description
-                    })
-                except:
-                    continue
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Erreur Sortiraujourdhui {categorie}: {e}")
-    return deals
-
-def get_open_agenda():
-    deals = []
-    url = "https://openagenda.com/agendas/89803504/events.json"
+    rss_url = "https://www.sortiraparis.com/rss.xml"
     try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            events = resp.json().get("events", [])
-            for e in events[:8]:
-                titre = e.get("title", {})
-                nom = titre.get("fr") or titre.get("en") if isinstance(titre, dict) else str(titre)
-                if not nom or len(nom) < 3:
-                    continue
-                lieu = e.get("locationName", "Ile-de-France")
-                if isinstance(lieu, dict):
-                    lieu = lieu.get("fr", "Ile-de-France")
-                deal_id = "open_" + str(e.get("uid", hashlib.md5(nom.encode()).hexdigest()[:8]))
-                deals.append({
-                    "id": deal_id, "titre": nom, "lieu": lieu,
-                    "categorie": "📅 Evenement / Expo",
-                    "image": e.get("image"),
-                    "url": f"https://openagenda.com/event/{e.get('slug', '')}",
-                    "source": "OpenAgenda",
-                    "description": e.get("description", {}).get("fr", "") if isinstance(e.get("description"), dict) else ""
-                })
+        feed = feedparser.parse(rss_url)
+        logger.info(f"Sortir à Paris : {len(feed.entries)} articles")
+        for entry in feed.entries[:10]:
+            deal_id = "sap_" + hashlib.md5(entry.link.encode()).hexdigest()[:12]
+            # Extraction image si dispo
+            image = None
+            if 'media_content' in entry:
+                image = entry.media_content['url']
+            
+            deals.append({
+                "id": deal_id,
+                "titre": entry.title,
+                "lieu": "Île-de-France",
+                "categorie": "🌟 Culture & Sorties",
+                "image": image,
+                "url": entry.link,
+                "source": "Sortir à Paris",
+                "description": entry.summary[:150] + "..." if 'summary' in entry else ""
+            })
     except Exception as e:
-        logger.error(f"Erreur OpenAgenda: {e}")
+        logger.error(f"Erreur RSS Sortir à Paris: {e}")
     return deals
 
+# --- SOURCE 2 : BILLETREDUC (PROMOS) ---
+def get_billetreduc(ville="Paris"):
+    deals = []
+    try:
+        url = f"https://www.billetreduc.com/paris/liste.htm"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Ciblage plus robuste
+            cards = soup.select(".lelt") or soup.select("table[class*='lelt']")
+            for card in cards[:6]:
+                try:
+                    link_el = card.find("a", class_="bold")
+                    if not link_el: continue
+                    titre = link_el.get_text(strip=True)
+                    url_deal = "https://www.billetreduc.com" + link_el['href']
+                    
+                    deal_id = "br_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    deals.append({
+                        "id": deal_id, "titre": titre, "lieu": ville,
+                        "categorie": "🎟️ Promo Spectacle", "image": None,
+                        "url": url_deal, "source": "BilletReduc", 
+                        "description": "Profitez de tarifs réduits sur BilletReduc."
+                    })
+                except: continue
+    except Exception as e:
+        logger.error(f"Erreur BilletReduc: {e}")
+    return deals
+
+# --- SOURCE 3 : QUE FAIRE À PARIS (OPEN DATA) ---
 def get_paris_events():
     deals = []
     url = "https://opendata.paris.fr/api/records/1.0/search/"
-    params = {"dataset": "que-faire-a-paris-", "rows": 8, "sort": "date_start"}
+    params = {"dataset": "que-faire-a-paris-", "rows": 5, "sort": "date_start"}
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
-                nom = f.get("title", "").strip()
-                if not nom or len(nom) < 3:
-                    continue
-                adresse = f.get("address_name", "")
-                cp = f.get("address_zipcode", "")
-                lieu = f"{adresse} ({cp})".strip("( )") if adresse else f"Paris {cp}"
-                categorie_raw = f.get("category", "Sortie")
-                date_debut = f.get("date_start", "")
-                date_str = f" - {date_debut[:10]}" if date_debut else ""
                 deal_id = "paris_" + r.get("recordid", "")[:12]
                 deals.append({
-                    "id": deal_id, "titre": nom, "lieu": lieu,
-                    "categorie": f"🎭 {categorie_raw}{date_str}",
+                    "id": deal_id, "titre": f.get("title", ""), 
+                    "lieu": f"Paris ({f.get('address_zipcode', '')})",
+                    "categorie": f"🎭 {f.get('category', 'Événement')}",
                     "image": f.get("cover_url"),
                     "url": f.get("url", "https://quefaire.paris.fr"),
-                    "source": "Que faire a Paris",
-                    "description": f.get("lead_text", "")
+                    "source": "Que faire à Paris",
+                    "description": f.get("lead_text", "")[:150]
                 })
     except Exception as e:
         logger.error(f"Erreur Paris Events: {e}")
     return deals
 
-def get_datatourisme():
-    deals = []
-    try:
-        resp = requests.get(DATATOURISME_FLUX_URL, timeout=15)
-        if resp.status_code == 200:
-            items = resp.json().get("@graph", [])
-            for item in items[:10]:
-                label = item.get("rdfs:label", {})
-                if isinstance(label, dict):
-                    nom = label.get("@value", "")
-                elif isinstance(label, list):
-                    nom = label[0].get("@value", "") if label else ""
-                else:
-                    nom = str(label)
-                if not nom or len(nom) < 3:
-                    continue
-                localisation = "Ile-de-France"
-                is_located = item.get("isLocatedAt", [])
-                if isinstance(is_located, list) and is_located:
-                    address = is_located[0].get("schema:address", {})
-                    if isinstance(address, list) and address:
-                        address = address[0]
-                    if isinstance(address, dict):
-                        localisation = address.get("schema:addressLocality", "Ile-de-France")
-                elif isinstance(is_located, dict):
-                    address = is_located.get("schema:address", {})
-                    if isinstance(address, dict):
-                        localisation = address.get("schema:addressLocality", "Ile-de-France")
-                deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
-                deals.append({
-                    "id": deal_id, "titre": nom, "lieu": localisation,
-                    "categorie": "🎡 Sortie & Loisirs", "image": None,
-                    "url": item.get("@id", "https://www.datatourisme.fr"),
-                    "source": "DATAtourisme",
-                    "description": "Lieu de loisirs reference par le Ministere du Tourisme francais."
-                })
-    except Exception as e:
-        logger.error(f"Erreur DATAtourisme: {e}")
-    return deals
-
-def get_billetreduc(ville="Paris"):
-    deals = []
-    try:
-        url = f"https://www.billetreduc.com/rech.htm?ville={ville}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Accept-Language": "fr-FR,fr;q=0.9",
-        }
-        resp = requests.get(url, headers=headers, timeout=20)
-        logger.info(f"BilletReduc status : {resp.status_code}")
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.select("div[class*='event']") or \
-                    soup.select("article") or \
-                    soup.select("div[class*='spectacle']") or \
-                    soup.select("li[class*='event']")
-            logger.info(f"BilletReduc : {len(cards)} spectacle(s)")
-            for card in cards[:8]:
-                try:
-                    titre_el = card.select_one("h2") or card.select_one("h3") or card.select_one("[class*='title']")
-                    titre = titre_el.get_text(strip=True) if titre_el else ""
-                    if not titre or len(titre) < 3:
-                        continue
-                    href = (card.select_one("a") or {}).get("href", "")
-                    url_deal = href if href.startswith("http") else "https://www.billetreduc.com" + href
-                    prix_el = card.select_one("[class*='price']") or card.select_one("[class*='tarif']")
-                    prix_txt = prix_el.get_text(strip=True) if prix_el else ""
-                    prix = int("".join(filter(str.isdigit, prix_txt.split("€")[0].replace(" ", "")))) if "€" in prix_txt else 0
-                    reduction_el = card.select_one("[class*='reduc']") or card.select_one("[class*='discount']")
-                    reduction_txt = reduction_el.get_text(strip=True) if reduction_el else ""
-                    reduction = int("".join(filter(str.isdigit, reduction_txt))) if any(c.isdigit() for c in reduction_txt) else 0
-                    desc = f"A partir de {prix}€" if prix > 0 else ""
-                    if reduction > 0:
-                        desc += f" - -{reduction}% de reduction"
-                    deal_id = "br_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
-                    deals.append({
-                        "id": deal_id, "titre": titre, "lieu": ville,
-                        "categorie": "🎟️ Spectacle - Billet reduit", "image": None,
-                        "url": url_deal, "source": "BilletReduc", "description": desc
-                    })
-                except:
-                    continue
-    except Exception as e:
-        logger.error(f"Erreur BilletReduc: {e}")
-    return deals
-
+# --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
-    emojis = {
-        "Sortiraparis": "✨",
-        "AgendaCulturel": "🎵",
-        "Sortiraujourdhui": "🗓️",
-        "OpenAgenda": "📅",
-        "Que faire a Paris": "🎭",
-        "DATAtourisme": "🎡",
-        "BilletReduc": "🎟️"
-    }
+    emojis = {"Sortir à Paris": "🌟", "BilletReduc": "🎟️", "Que faire à Paris": "🎭"}
     emoji = emojis.get(deal["source"], "✨")
-    description = deal.get("description", "")
-    desc_str = f"\n💬 _{description[:120]}..._\n" if description and len(description) > 10 else "\n"
+    
     caption = (
         f"{emoji} *PROPOSITION CEZAP*\n\n"
         f"🎯 *{deal['titre']}*\n"
         f"📍 {deal['lieu']}\n"
-        f"📂 {deal['categorie']}\n"
-        f"{desc_str}\n"
-        f"🔗 [Voir les details]({deal['url']})"
+        f"📂 {deal['categorie']}\n\n"
+        f"💬 _{deal['description']}_\n\n"
+        f"🔗 [Voir les détails]({deal['url']})"
     )
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     method = "sendPhoto" if deal.get("image") else "sendMessage"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown", "disable_web_page_preview": False}
+    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown"}
+    
     if deal.get("image"):
         payload["photo"] = deal["image"]
         payload["caption"] = caption
     else:
         payload["text"] = caption
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            logger.info(f"Envoye : {deal['titre']}")
-        else:
-            logger.error(f"Erreur Telegram {resp.status_code}: {resp.text[:100]}")
-    except Exception as e:
-        logger.error(f"Erreur Telegram: {e}")
 
-def envoyer_resume(alertes):
-    if not alertes:
-        return
-    top = alertes[:5]
-    lignes = []
-    for i, a in enumerate(top, 1):
-        lignes.append(f"{i}. *{a['titre']}* - {a['lieu']} ({a['source']})")
-    message = (
-        f"🌅 *Bonjour ! Les meilleures idees du jour pour votre CE*\n\n"
-        f"📅 {datetime.now().strftime('%A %d %B %Y')}\n\n"
-        + "\n".join(lignes) +
-        f"\n\n_Cezap - Votre CE toujours inspire_ 🎉"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }, timeout=10)
-        logger.info("Resume quotidien envoye !")
+        requests.post(url + method, json=payload, timeout=10)
     except Exception as e:
-        logger.error(f"Erreur resume: {e}")
+        logger.error(f"Erreur envoi Telegram: {e}")
 
+# --- JOB PRINCIPAL ---
 def job(avec_resume=False):
-    logger.info("Lancement du scan Cezap...")
+    logger.info("Scan en cours...")
     init_db()
-    if avec_resume:
-        vider_cache()
-    alertes = (
-        get_sortiraparis() +
-        get_agenda_culturel() +
-        get_sortiraujourdhui() +
-        get_open_agenda() +
-        get_paris_events() +
-        get_datatourisme() +
-        get_billetreduc()
-    )
-    if avec_resume:
-        envoyer_resume(alertes)
+    
+    # On rassemble toutes les sources
+    alertes = get_sortiraparis() + get_paris_events() + get_billetreduc()
+    
     envois = 0
     for a in alertes:
-        if not a.get("titre") or len(a["titre"]) < 5:
-            continue
         if is_new(a["id"], "Prod_CE"):
             envoyer_telegram(a)
             save_alert(a["id"], "Prod_CE")
             envois += 1
             time.sleep(2)
-    logger.info(f"Scan termine. {envois} alertes envoyees.")
+    logger.info(f"Scan terminé. {envois} nouvelles alertes.")
 
+# --- LANCEMENT ---
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and CHAT_ID:
-        job(avec_resume=False)
-        schedule.every().day.at("08:00").do(lambda: job(avec_resume=True))
+        job() # Premier lancement
         schedule.every(4).hours.do(job)
         while True:
             schedule.run_pending()
             time.sleep(60)
     else:
-        logger.error("TELEGRAM_TOKEN ou CHAT_ID manquant !")
+        logger.error("Variables d'environnement manquantes !")
