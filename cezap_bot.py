@@ -49,89 +49,149 @@ def vider_cache():
     conn.close()
     logger.info("Cache vide !")
 
-# --- SOURCE 1 : RESTAURATION (Alim'confiance) ---
-# Mots clés qui indiquent un vrai restaurant
-MOTS_RESTAURANT = [
-    "restaurant", "brasserie", "bistrot", "bistro", "café", "cafe",
-    "pizzeria", "sushi", "japonais", "italien", "chinois", "thaï",
-    "thai", "indien", "libanais", "marocain", "mexicain", "grec",
-    "traiteur", "gastronomie", "gastronomique", "brasier", "taverne",
-    "auberge", "hostellerie", "grill", "steakhouse", "crêperie",
-    "creperie", "bouchon", "estaminet", "wok", "ramen", "burger",
-    "cantine", "buffet", "bistronomie", "table", "chez "
-]
-
-# Mots clés qui indiquent ce qu'on veut EXCLURE
-MOTS_EXCLUSION = [
-    "boucherie", "charcuterie", "supermarche", "supermarché",
-    "hypermarche", "hypermarché", "epicerie", "épicerie",
-    "boulangerie", "patisserie", "pâtisserie", "confiserie",
-    "poissonerie", "poissonnerie", "fromagerie", "cave",
-    "primeur", "fruits", "legumes", "légumes", "alimentation",
-    "generale", "générale", "station", "snack", "sandwicherie",
-    "kebab", "fast food", "fastfood", "vente", "distribution",
-    "grossiste", "centrale", "entrepot", "entrepôt"
-]
-
-def get_alim_confiance(ville="Paris"):
+# --- SOURCE 1 : SORTIRAPARIS ---
+def get_sortiraparis():
     deals = []
-    url = "https://dgal.opendatasoft.com/api/records/1.0/search/"
+    categories = [
+        ("https://www.sortiraparis.com/loisirs/spectacle", "🎭 Spectacle"),
+        ("https://www.sortiraparis.com/restaurants", "🍽️ Restaurant"),
+        ("https://www.sortiraparis.com/arts-culture/exposition", "🎨 Exposition"),
+        ("https://www.sortiraparis.com/loisirs", "🎡 Loisirs"),
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    for url, categorie in categories:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            logger.info(f"Sortiraparis {categorie} status : {resp.status_code}")
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Plusieurs sélecteurs possibles
+            cards = soup.select("article[class*='item']") or \
+                    soup.select("div[class*='item-list']") or \
+                    soup.select("div[class*='card']") or \
+                    soup.select("article") or \
+                    soup.select("li[class*='item']")
+            logger.info(f"Sortiraparis {categorie} : {len(cards)} article(s)")
+            for card in cards[:5]:
+                try:
+                    # Titre
+                    titre_el = card.select_one("h2") or card.select_one("h3") or \
+                               card.select_one("[class*='title']") or card.select_one("a")
+                    titre = titre_el.get_text(strip=True) if titre_el else ""
+                    if not titre or len(titre) < 5:
+                        continue
+                    # URL
+                    link_el = card.select_one("a[href*='sortiraparis']") or card.select_one("a")
+                    href = link_el.get("href", "") if link_el else ""
+                    url_deal = href if href.startswith("http") else "https://www.sortiraparis.com" + href
+                    if not href:
+                        continue
+                    # Image
+                    img_el = card.select_one("img")
+                    image = img_el.get("src") or img_el.get("data-src") if img_el else None
+                    if image and not image.startswith("http"):
+                        image = None
+                    # Description
+                    desc_el = card.select_one("p") or card.select_one("[class*='desc']") or \
+                              card.select_one("[class*='intro']")
+                    description = desc_el.get_text(strip=True)[:150] if desc_el else ""
+                    # Lieu
+                    lieu_el = card.select_one("[class*='location']") or card.select_one("[class*='lieu']") or \
+                              card.select_one("[class*='address']")
+                    lieu = lieu_el.get_text(strip=True) if lieu_el else "Paris"
+                    deal_id = "sap_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    deals.append({
+                        "id": deal_id,
+                        "titre": titre,
+                        "lieu": lieu or "Paris",
+                        "categorie": categorie,
+                        "image": image,
+                        "url": url_deal,
+                        "source": "Sortiraparis",
+                        "description": description
+                    })
+                except:
+                    continue
+            time.sleep(1)  # Pause entre chaque catégorie
+        except Exception as e:
+            logger.error(f"Erreur Sortiraparis {categorie}: {e}")
+    return deals
+
+# --- SOURCE 2 : OPENAGENDA ---
+def get_open_agenda():
+    deals = []
+    url = "https://openagenda.com/agendas/89803504/events.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            events = resp.json().get("events", [])
+            for e in events[:8]:
+                titre = e.get("title", {})
+                nom = titre.get("fr") or titre.get("en") if isinstance(titre, dict) else str(titre)
+                if not nom or len(nom) < 3:
+                    continue
+                lieu = e.get("locationName", "Île-de-France")
+                if isinstance(lieu, dict):
+                    lieu = lieu.get("fr", "Île-de-France")
+                deal_id = "open_" + str(e.get("uid", hashlib.md5(nom.encode()).hexdigest()[:8]))
+                deals.append({
+                    "id": deal_id,
+                    "titre": nom,
+                    "lieu": lieu,
+                    "categorie": "📅 Événement / Expo",
+                    "image": e.get("image"),
+                    "url": f"https://openagenda.com/event/{e.get('slug', '')}",
+                    "source": "OpenAgenda",
+                    "description": e.get("description", {}).get("fr", "") if isinstance(e.get("description"), dict) else ""
+                })
+    except Exception as e:
+        logger.error(f"Erreur OpenAgenda: {e}")
+    return deals
+
+# --- SOURCE 3 : QUE FAIRE A PARIS ---
+def get_paris_events():
+    deals = []
+    url = "https://opendata.paris.fr/api/records/1.0/search/"
     params = {
-        "dataset": "export_alimconfiance",
-        "q": ville,
-        "rows": 20,  # On prend plus pour avoir assez après filtrage
-        "refine.synthese_eval_sanitaire": "Très satisfaisant"
+        "dataset": "que-faire-a-paris-",
+        "rows": 8,
+        "sort": "date_start"
     }
     try:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
-                nom = f.get("app_libelle_etablissement", "").strip()
-                if not nom or len(nom) < 3 or nom.upper() in ["PARIS", "FRANCE", "IDF"]:
+                nom = f.get("title", "").strip()
+                if not nom or len(nom) < 3:
                     continue
-
-                nom_lower = nom.lower()
-                activite = f.get("libelle_activite_etablissement", "").lower()
-                texte_complet = f"{nom_lower} {activite}"
-
-                # Exclure les établissements non-restaurant
-                if any(mot in texte_complet for mot in MOTS_EXCLUSION):
-                    continue
-
-                # Garder uniquement les vrais restaurants
-                est_restaurant = any(mot in texte_complet for mot in MOTS_RESTAURANT)
-
-                # Si activité contient "restaurant" explicitement c'est bon
-                if "restaur" in activite:
-                    est_restaurant = True
-
-                if not est_restaurant:
-                    continue
-
-                adresse = f.get("adresse_etablissement", "")
-                commune = f.get("libelle_commune", "")
-                lieu = f"{adresse}, {commune}".strip(", ")
-                deal_id = "alim_" + hashlib.md5(f"{nom}{adresse}".encode()).hexdigest()[:12]
+                adresse = f.get("address_name", "")
+                cp = f.get("address_zipcode", "")
+                lieu = f"{adresse} ({cp})".strip("( )") if adresse else f"Paris {cp}"
+                categorie_raw = f.get("category", "Sortie")
+                date_debut = f.get("date_start", "")
+                date_str = f" — {date_debut[:10]}" if date_debut else ""
+                deal_id = "paris_" + r.get("recordid", "")[:12]
                 deals.append({
                     "id": deal_id,
-                    "titre": nom.title(),
+                    "titre": nom,
                     "lieu": lieu,
-                    "categorie": "🍽️ Restaurant — Hygiène certifiée ★★★",
-                    "image": None,
-                    "url": f"https://www.google.com/search?q={nom.replace(' ', '+')}+{commune}+restaurant",
-                    "source": "Alim'confiance",
-                    "description": "Restaurant avec une note hygiène TRÈS SATISFAISANTE selon les contrôles officiels."
+                    "categorie": f"🎭 {categorie_raw}{date_str}",
+                    "image": f.get("cover_url"),
+                    "url": f.get("url", "https://quefaire.paris.fr"),
+                    "source": "Que faire à Paris",
+                    "description": f.get("lead_text", "")
                 })
-
-                if len(deals) >= 5:  # Max 5 restaurants par scan
-                    break
-
     except Exception as e:
-        logger.error(f"Erreur Alim: {e}")
+        logger.error(f"Erreur Paris Events: {e}")
     return deals
 
-# --- SOURCE 2 : LOISIRS (DATAtourisme) ---
+# --- SOURCE 4 : DATATOURISME ---
 def get_datatourisme():
     deals = []
     try:
@@ -173,75 +233,6 @@ def get_datatourisme():
                 })
     except Exception as e:
         logger.error(f"Erreur DATAtourisme: {e}")
-    return deals
-
-# --- SOURCE 3 : EVENEMENTS (OpenAgenda) ---
-def get_open_agenda():
-    deals = []
-    url = "https://openagenda.com/agendas/89803504/events.json"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            events = resp.json().get("events", [])
-            for e in events[:8]:
-                titre = e.get("title", {})
-                nom = titre.get("fr") or titre.get("en") if isinstance(titre, dict) else str(titre)
-                if not nom or len(nom) < 3:
-                    continue
-                lieu = e.get("locationName", "Île-de-France")
-                if isinstance(lieu, dict):
-                    lieu = lieu.get("fr", "Île-de-France")
-                deal_id = "open_" + str(e.get("uid", hashlib.md5(nom.encode()).hexdigest()[:8]))
-                deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": lieu,
-                    "categorie": "📅 Événement / Expo",
-                    "image": e.get("image"),
-                    "url": f"https://openagenda.com/event/{e.get('slug', '')}",
-                    "source": "OpenAgenda",
-                    "description": e.get("description", {}).get("fr", "") if isinstance(e.get("description"), dict) else ""
-                })
-    except Exception as e:
-        logger.error(f"Erreur OpenAgenda: {e}")
-    return deals
-
-# --- SOURCE 4 : SPECTACLES (Que faire à Paris ?) ---
-def get_paris_events():
-    deals = []
-    url = "https://opendata.paris.fr/api/records/1.0/search/"
-    params = {
-        "dataset": "que-faire-a-paris-",
-        "rows": 8,
-        "sort": "date_start"
-    }
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code == 200:
-            for r in resp.json().get("records", []):
-                f = r.get("fields", {})
-                nom = f.get("title", "").strip()
-                if not nom or len(nom) < 3:
-                    continue
-                adresse = f.get("address_name", "")
-                cp = f.get("address_zipcode", "")
-                lieu = f"{adresse} ({cp})".strip("( )") if adresse else f"Paris {cp}"
-                categorie_raw = f.get("category", "Sortie")
-                date_debut = f.get("date_start", "")
-                date_str = f" — {date_debut[:10]}" if date_debut else ""
-                deal_id = "paris_" + r.get("recordid", "")[:12]
-                deals.append({
-                    "id": deal_id,
-                    "titre": nom,
-                    "lieu": lieu,
-                    "categorie": f"🎭 {categorie_raw}{date_str}",
-                    "image": f.get("cover_url"),
-                    "url": f.get("url", "https://quefaire.paris.fr"),
-                    "source": "Que faire à Paris",
-                    "description": f.get("lead_text", "")
-                })
-    except Exception as e:
-        logger.error(f"Erreur Paris Events: {e}")
     return deals
 
 # --- SOURCE 5 : BILLETREDUC ---
@@ -299,10 +290,10 @@ def get_billetreduc(ville="Paris"):
 # --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
     emojis = {
-        "Alim'confiance": "🍴",
-        "DATAtourisme": "🎡",
+        "Sortiraparis": "✨",
         "OpenAgenda": "📅",
         "Que faire à Paris": "🎭",
+        "DATAtourisme": "🎡",
         "BilletReduc": "🎟️"
     }
     emoji = emojis.get(deal["source"], "✨")
@@ -368,15 +359,14 @@ def job(avec_resume=False):
     logger.info("Lancement du scan Cezap...")
     init_db()
 
-    # Vider le cache au résumé quotidien
     if avec_resume:
         vider_cache()
 
     alertes = (
-        get_alim_confiance() +
-        get_datatourisme() +
+        get_sortiraparis() +
         get_open_agenda() +
         get_paris_events() +
+        get_datatourisme() +
         get_billetreduc()
     )
 
@@ -385,7 +375,7 @@ def job(avec_resume=False):
 
     envois = 0
     for a in alertes:
-        if not a.get("titre") or len(a["titre"]) < 3:
+        if not a.get("titre") or len(a["titre"]) < 5:
             continue
         if is_new(a["id"], "Prod_CE"):
             envoyer_telegram(a)
