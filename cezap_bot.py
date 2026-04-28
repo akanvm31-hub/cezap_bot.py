@@ -6,6 +6,7 @@ import schedule
 import time
 import logging
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 # --- CONFIGURATION ---
 DATATOURISME_FLUX_URL = "https://diffuseur.datatourisme.fr/webservice/f5ba593fdfeb0297cc2f33aed8fb203f/f23e25c9-de75-481c-be0c-76beac417ade"
@@ -57,7 +58,6 @@ def get_alim_confiance(ville="Paris"):
             for r in resp.json().get("records", []):
                 f = r.get("fields", {})
                 nom = f.get("app_libelle_etablissement", "").strip()
-                # Filtre : ignorer les noms trop courts ou génériques
                 if not nom or len(nom) < 3 or nom.upper() in ["PARIS", "FRANCE", "IDF"]:
                     continue
                 adresse = f.get("adresse_etablissement", "")
@@ -86,7 +86,6 @@ def get_datatourisme():
         if resp.status_code == 200:
             items = resp.json().get("@graph", [])
             for item in items[:10]:
-                # Extraction du nom
                 label = item.get("rdfs:label", {})
                 if isinstance(label, dict):
                     nom = label.get("@value", "")
@@ -94,11 +93,8 @@ def get_datatourisme():
                     nom = label[0].get("@value", "") if label else ""
                 else:
                     nom = str(label)
-
                 if not nom or len(nom) < 3:
                     continue
-
-                # Extraction de la localisation — isLocatedAt est une liste
                 localisation = "Île-de-France"
                 is_located = item.get("isLocatedAt", [])
                 if isinstance(is_located, list) and is_located:
@@ -111,7 +107,6 @@ def get_datatourisme():
                     address = is_located.get("schema:address", {})
                     if isinstance(address, dict):
                         localisation = address.get("schema:addressLocality", "Île-de-France")
-
                 deal_id = "data_" + hashlib.md5(nom.encode()).hexdigest()[:12]
                 deals.append({
                     "id": deal_id,
@@ -196,13 +191,66 @@ def get_paris_events():
         logger.error(f"Erreur Paris Events: {e}")
     return deals
 
+# --- SOURCE 5 : BILLETREDUC ---
+def get_billetreduc(ville="Paris"):
+    deals = []
+    try:
+        url = f"https://www.billetreduc.com/rech.htm?ville={ville}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Accept-Language": "fr-FR,fr;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=20)
+        logger.info(f"BilletReduc status : {resp.status_code}")
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            cards = soup.select("div[class*='event']") or \
+                    soup.select("article") or \
+                    soup.select("div[class*='spectacle']") or \
+                    soup.select("li[class*='event']")
+            logger.info(f"BilletReduc : {len(cards)} spectacle(s)")
+            for card in cards[:8]:
+                try:
+                    titre_el = card.select_one("h2") or card.select_one("h3") or card.select_one("[class*='title']")
+                    titre = titre_el.get_text(strip=True) if titre_el else ""
+                    if not titre or len(titre) < 3:
+                        continue
+                    href = (card.select_one("a") or {}).get("href", "")
+                    url_deal = href if href.startswith("http") else "https://www.billetreduc.com" + href
+                    prix_el = card.select_one("[class*='price']") or card.select_one("[class*='tarif']")
+                    prix_txt = prix_el.get_text(strip=True) if prix_el else ""
+                    prix = int("".join(filter(str.isdigit, prix_txt.split("€")[0].replace(" ", "")))) if "€" in prix_txt else 0
+                    reduction_el = card.select_one("[class*='reduc']") or card.select_one("[class*='discount']")
+                    reduction_txt = reduction_el.get_text(strip=True) if reduction_el else ""
+                    reduction = int("".join(filter(str.isdigit, reduction_txt))) if any(c.isdigit() for c in reduction_txt) else 0
+                    desc = f"À partir de {prix}€" if prix > 0 else ""
+                    if reduction > 0:
+                        desc += f" — -{reduction}% de réduction"
+                    deal_id = "br_" + hashlib.md5(url_deal.encode()).hexdigest()[:12]
+                    deals.append({
+                        "id": deal_id,
+                        "titre": titre,
+                        "lieu": ville,
+                        "categorie": "🎟️ Spectacle — Billet réduit",
+                        "image": None,
+                        "url": url_deal,
+                        "source": "BilletReduc",
+                        "description": desc
+                    })
+                except:
+                    continue
+    except Exception as e:
+        logger.error(f"Erreur BilletReduc: {e}")
+    return deals
+
 # --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
     emojis = {
         "Alim'confiance": "🍴",
         "DATAtourisme": "🎡",
         "OpenAgenda": "📅",
-        "Que faire à Paris": "🎭"
+        "Que faire à Paris": "🎭",
+        "BilletReduc": "🎟️"
     }
     emoji = emojis.get(deal["source"], "✨")
     description = deal.get("description", "")
@@ -271,7 +319,8 @@ def job(avec_resume=False):
         get_alim_confiance() +
         get_datatourisme() +
         get_open_agenda() +
-        get_paris_events()
+        get_paris_events() +
+        get_billetreduc()
     )
 
     if avec_resume:
@@ -293,9 +342,7 @@ def job(avec_resume=False):
 if __name__ == "__main__":
     if TELEGRAM_TOKEN and CHAT_ID:
         job(avec_resume=False)
-        # Resume quotidien a 8h
         schedule.every().day.at("08:00").do(lambda: job(avec_resume=True))
-        # Scan toutes les 4h
         schedule.every(4).hours.do(job)
         while True:
             schedule.run_pending()
