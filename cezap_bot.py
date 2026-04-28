@@ -1,7 +1,6 @@
 import os
 import requests
 import logging
-from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -12,10 +11,10 @@ logger = logging.getLogger(__name__)
 
 AGENDAS = [
     ("84693279", "Paris Culture"),
-    ("55980392", "Que faire a Paris"),
-    ("40839291", "Ile-de-France"),
     ("86184123", "Sciences IDF"),
-    ("81082412", "Exploradome"),
+    ("52624664", "Sortir Paris"),
+    ("67495029", "Culture IDF"),
+    ("78431256", "Paris Evenements"),
 ]
 
 def get_events(agenda_uid, ville):
@@ -71,22 +70,22 @@ def get_events(agenda_uid, ville):
 
 def envoyer_telegram(deal):
     description = deal.get("description", "")
-    desc_str = f"\n💬 _{description[:120]}..._\n" if description and len(description) > 10 else "\n"
-    caption = (
-        f"📅 *PROPOSITION CEZAP*\n\n"
-        f"🎯 *{deal['titre']}*\n"
+    desc_str = f"\n{description[:120]}\n" if description and len(description) > 10 else "\n"
+
+    texte = (
+        f"📅 PROPOSITION CEZAP\n\n"
+        f"🎯 {deal['titre']}\n"
         f"📍 {deal['lieu']}\n"
         f"{desc_str}\n"
-        f"🔗 [Voir les détails]({deal['url']})"
+        f"🔗 {deal['url']}"
     )
-    method = "sendPhoto" if deal.get("image") else "sendMessage"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    payload = {"chat_id": CHAT_ID, "parse_mode": "Markdown", "disable_web_page_preview": False}
-    if deal.get("image"):
-        payload["photo"] = deal["image"]
-        payload["caption"] = caption
-    else:
-        payload["text"] = caption
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": texte,
+        "disable_web_page_preview": False
+    }
     resp = requests.post(url, json=payload, timeout=10)
     logger.info(f"Telegram {resp.status_code} — {deal['titre']}")
 
