@@ -9,7 +9,7 @@ from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-GOOGLE_API_KEY = "AIzaSyBPchV5emsHbexDq1jXpV7q7gBB4HONsEs"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DB_NAME = "cezap.db"
 
 logging.basicConfig(level=logging.INFO)
