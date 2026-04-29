@@ -16,18 +16,15 @@ DB_NAME = "cezap.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# On se concentre sur des types larges pour Paris
 RECHERCHES = [
     {"ville": "Paris", "type": "restaurant", "categorie": "Restaurant", "emoji": "🍴"},
     {"ville": "Paris", "type": "tourist_attraction", "categorie": "Lieu Touristique", "emoji": "📸"},
     {"ville": "Paris", "type": "museum", "categorie": "Musée", "emoji": "🏛️"},
-    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"},
-    {"ville": "Paris", "type": "spa", "categorie": "Bien-être", "emoji": "💆"}
+    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"}
 ]
 
 VILLES_COORDS = {"Paris": "48.8566,2.3522"}
 
-# --- BASE DE DONNÉES ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     conn.execute("CREATE TABLE IF NOT EXISTS sent_alerts (item_id TEXT PRIMARY KEY, client TEXT, date_sent TEXT)")
@@ -46,7 +43,6 @@ def save_alert(item_id, client_nom):
     conn.commit()
     conn.close()
 
-# --- LOGIQUE GOOGLE PLACES ---
 def get_google_places(ville, place_type, categorie, emoji):
     deals = []
     logger.info(f"🔎 Scan Google : {categorie} à {ville}...")
@@ -55,18 +51,20 @@ def get_google_places(ville, place_type, categorie, emoji):
         url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
         params = {
             "location": coords,
-            "radius": 10000, # Rayon étendu à 10km
+            "radius": 10000,
             "type": place_type,
             "key": GOOGLE_API_KEY,
             "language": "fr"
         }
         resp = requests.get(url, params=params, timeout=10)
-        
-        if resp.status_code != 200:
-            logger.error(f"❌ Erreur API Google {resp.status_code}")
+        data = resp.json()
+
+        # --- CORRECTION ICI : On vérifie que data est bien un dictionnaire ---
+        if not isinstance(data, dict):
+            logger.error(f"❌ Format JSON invalide reçu de Google")
             return []
 
-        results = resp.json().get("results", [])
+        results = data.get("results", [])
         logger.info(f"✅ {len(results)} résultats reçus pour {categorie}")
 
         for place in results[:5]:
@@ -74,17 +72,20 @@ def get_google_places(ville, place_type, categorie, emoji):
             nb_avis = place.get("user_ratings_total", 0)
             nom = place.get("name")
 
-            # FILTRE ASSOUPLLI : 3.0 minimum, pas de limite d'avis pour le test
+            # FILTRE : Note 3.0 minimum
             if note < 3.0:
-                logger.info(f"⚠️ Ignoré (Note {note} < 3.0) : {nom}")
                 continue
 
             place_id = place.get("place_id")
-            photo_ref = place.get("photos", [{}]).get("photo_reference") if place.get("photos") else None
-            
+            if not place_id: continue
+
+            # Gestion sécurisée de la photo
             image_url = None
-            if photo_ref:
-                image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
+            photos = place.get("photos")
+            if photos and isinstance(photos, list) and len(photos) > 0:
+                photo_ref = photos.get("photo_reference")
+                if photo_ref:
+                    image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
 
             deals.append({
                 "id": "gp_" + hashlib.md5(place_id.encode()).hexdigest()[:12],
@@ -98,10 +99,9 @@ def get_google_places(ville, place_type, categorie, emoji):
                 "url": f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
             })
     except Exception as e:
-        logger.error(f"💥 Erreur Google : {e}")
+        logger.error(f"💥 Erreur dans get_google_places : {e}")
     return deals
 
-# --- ENVOI TELEGRAM ---
 def envoyer_telegram(deal):
     texte = (
         f"{deal['emoji']} *PROPOSITION CEZAP*\n\n"
@@ -115,22 +115,16 @@ def envoyer_telegram(deal):
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     try:
         if deal['image']:
-            r = requests.post(base_url + "sendPhoto", data={"chat_id": CHAT_ID, "photo": deal['image'], "caption": texte, "parse_mode": "Markdown"}, timeout=10)
+            requests.post(base_url + "sendPhoto", data={"chat_id": CHAT_ID, "photo": deal['image'], "caption": texte, "parse_mode": "Markdown"}, timeout=10)
         else:
-            r = requests.post(base_url + "sendMessage", data={"chat_id": CHAT_ID, "text": texte, "parse_mode": "Markdown"}, timeout=10)
-        
-        if r.status_code == 200:
-            logger.info(f"🚀 Succès Telegram : {deal['titre']}")
-        else:
-            logger.error(f"⚠️ Erreur Telegram {r.status_code}")
+            requests.post(base_url + "sendMessage", data={"chat_id": CHAT_ID, "text": texte, "parse_mode": "Markdown"}, timeout=10)
+        logger.info(f"🚀 Envoyé : {deal['titre']}")
     except Exception as e:
         logger.error(f"💥 Erreur envoi : {e}")
 
-# --- JOB ---
 def job():
     logger.info("--- DÉMARRAGE DU SCAN ---")
     init_db()
-    
     total = 0
     for r in RECHERCHES:
         deals = get_google_places(r["ville"], r["type"], r["categorie"], r["emoji"])
@@ -139,18 +133,15 @@ def job():
                 envoyer_telegram(d)
                 save_alert(d["id"], "Prod_CE")
                 total += 1
-                time.sleep(1) # Petit délai
-    
-    logger.info(f"--- FIN DU SCAN : {total} messages envoyés ---")
+                time.sleep(1)
+    logger.info(f"--- FIN : {total} messages ---")
 
-# --- MAIN ---
 if __name__ == "__main__":
     if not GOOGLE_API_KEY:
-        logger.error("❌ CLÉ GOOGLE MANQUANTE DANS RAILWAY")
+        logger.error("❌ Pas de clé Google")
     else:
-        job() # Exécution directe
-        schedule.every(4).hours.do(job)
-        
+        job()
+        schedule.every(8).hours.do(job)
         while True:
             schedule.run_pending()
             time.sleep(60)
