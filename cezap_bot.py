@@ -16,11 +16,12 @@ DB_NAME = "cezap.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# On se concentre sur des types larges pour Paris
 RECHERCHES = [
     {"ville": "Paris", "type": "restaurant", "categorie": "Restaurant", "emoji": "🍴"},
-    {"ville": "Paris", "type": "amusement_park", "categorie": "Parc d'attractions", "emoji": "🎡"},
-    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"},
+    {"ville": "Paris", "type": "tourist_attraction", "categorie": "Lieu Touristique", "emoji": "📸"},
     {"ville": "Paris", "type": "museum", "categorie": "Musée", "emoji": "🏛️"},
+    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"},
     {"ville": "Paris", "type": "spa", "categorie": "Bien-être", "emoji": "💆"}
 ]
 
@@ -48,13 +49,13 @@ def save_alert(item_id, client_nom):
 # --- LOGIQUE GOOGLE PLACES ---
 def get_google_places(ville, place_type, categorie, emoji):
     deals = []
-    logger.info(f"🔎 Recherche Google : {categorie} à {ville}...")
+    logger.info(f"🔎 Scan Google : {categorie} à {ville}...")
     try:
         coords = VILLES_COORDS.get(ville, "48.8566,2.3522")
         url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
         params = {
             "location": coords,
-            "radius": 5000,
+            "radius": 10000, # Rayon étendu à 10km
             "type": place_type,
             "key": GOOGLE_API_KEY,
             "language": "fr"
@@ -62,20 +63,20 @@ def get_google_places(ville, place_type, categorie, emoji):
         resp = requests.get(url, params=params, timeout=10)
         
         if resp.status_code != 200:
-            logger.error(f"❌ Erreur API Google {resp.status_code}: {resp.text}")
+            logger.error(f"❌ Erreur API Google {resp.status_code}")
             return []
 
         results = resp.json().get("results", [])
-        logger.info(f"✅ {len(results)} lieux trouvés pour {categorie}")
+        logger.info(f"✅ {len(results)} résultats reçus pour {categorie}")
 
         for place in results[:5]:
             note = place.get("rating", 0)
             nb_avis = place.get("user_ratings_total", 0)
             nom = place.get("name")
 
-            # FILTRE QUALITÉ (On baisse un peu pour être sûr d'avoir des résultats au début)
-            if note < 3.5 or nb_avis < 20:
-                logger.info(f"跳 Ignoré (Qualité insuffisante) : {nom} ({note}⭐)")
+            # FILTRE ASSOUPLLI : 3.0 minimum, pas de limite d'avis pour le test
+            if note < 3.0:
+                logger.info(f"⚠️ Ignoré (Note {note} < 3.0) : {nom}")
                 continue
 
             place_id = place.get("place_id")
@@ -97,7 +98,7 @@ def get_google_places(ville, place_type, categorie, emoji):
                 "url": f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
             })
     except Exception as e:
-        logger.error(f"💥 Erreur critique Google : {e}")
+        logger.error(f"💥 Erreur Google : {e}")
     return deals
 
 # --- ENVOI TELEGRAM ---
@@ -107,50 +108,48 @@ def envoyer_telegram(deal):
         f"🎯 *{deal['titre']}*\n"
         f"📍 {deal['lieu']}\n"
         f"📂 {deal['categorie']}\n"
-        f"⭐ {deal['note']}/5 ({deal['avis']} avis Google)\n\n"
+        f"⭐ {deal['note']}/5 ({deal['avis']} avis)\n\n"
         f"🔗 [Ouvrir dans Google Maps]({deal['url']})"
     )
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     try:
         if deal['image']:
-            # Envoi avec photo
             r = requests.post(base_url + "sendPhoto", data={"chat_id": CHAT_ID, "photo": deal['image'], "caption": texte, "parse_mode": "Markdown"}, timeout=10)
         else:
-            # Envoi texte simple
             r = requests.post(base_url + "sendMessage", data={"chat_id": CHAT_ID, "text": texte, "parse_mode": "Markdown"}, timeout=10)
         
         if r.status_code == 200:
-            logger.info(f"🚀 Message envoyé pour : {deal['titre']}")
+            logger.info(f"🚀 Succès Telegram : {deal['titre']}")
         else:
-            logger.error(f"⚠️ Échec Telegram {r.status_code}: {r.text}")
+            logger.error(f"⚠️ Erreur Telegram {r.status_code}")
     except Exception as e:
-        logger.error(f"💥 Erreur envoi Telegram : {e}")
+        logger.error(f"💥 Erreur envoi : {e}")
 
 # --- JOB ---
 def job():
-    logger.info("--- DÉBUT DU SCAN CEZAP ---")
+    logger.info("--- DÉMARRAGE DU SCAN ---")
     init_db()
     
-    total_envois = 0
+    total = 0
     for r in RECHERCHES:
         deals = get_google_places(r["ville"], r["type"], r["categorie"], r["emoji"])
         for d in deals:
             if is_new(d["id"], "Prod_CE"):
                 envoyer_telegram(d)
                 save_alert(d["id"], "Prod_CE")
-                total_envois += 1
-                time.sleep(2) # Anti-spam Telegram
+                total += 1
+                time.sleep(1) # Petit délai
     
-    logger.info(f"--- FIN DU SCAN : {total_envois} nouvelles alertes envoyées ---")
+    logger.info(f"--- FIN DU SCAN : {total} messages envoyés ---")
 
 # --- MAIN ---
 if __name__ == "__main__":
-    if not all([TELEGRAM_TOKEN, CHAT_ID, GOOGLE_API_KEY]):
-        logger.error("❌ Variables d'environnement manquantes ! Vérifie Railway.")
+    if not GOOGLE_API_KEY:
+        logger.error("❌ CLÉ GOOGLE MANQUANTE DANS RAILWAY")
     else:
-        job() # Premier lancement immédiat
-        schedule.every(8).hours.do(job) # Toutes les 8 heures
+        job() # Exécution directe
+        schedule.every(4).hours.do(job)
         
         while True:
             schedule.run_pending()
