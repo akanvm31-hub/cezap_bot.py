@@ -7,21 +7,23 @@ import time
 import logging
 from datetime import datetime
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION RAILWAY ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# On change encore le nom pour repartir sur une base propre
-DB_NAME = "cezap_ultra_safe.db"
+# Nom de la DB pour cette version finale
+DB_NAME = "cezap_production_v1.db"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Types de lieux pour Paris (optimisés pour un CSE)
 RECHERCHES = [
     {"ville": "Paris", "type": "restaurant", "categorie": "Restaurant", "emoji": "🍴"},
     {"ville": "Paris", "type": "tourist_attraction", "categorie": "Sortie Culturelle", "emoji": "📸"},
     {"ville": "Paris", "type": "museum", "categorie": "Musée", "emoji": "🏛️"},
-    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"}
+    {"ville": "Paris", "type": "movie_theater", "categorie": "Cinéma", "emoji": "🎬"},
+    {"ville": "Paris", "type": "spa", "categorie": "Bien-être & Spa", "emoji": "💆"}
 ]
 
 VILLES_COORDS = {"Paris": "48.8566,2.3522"}
@@ -56,17 +58,15 @@ def get_google_places(ville, place_type, categorie, emoji):
             "key": GOOGLE_API_KEY,
             "language": "fr"
         }
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
 
         if not isinstance(data, dict): return []
-
         results = data.get("results", [])
         if not isinstance(results, list): return []
 
-        for place in results[:10]: # On prend les 10 premiers
+        for place in results[:8]: # Top 8 par catégorie
             try:
-                # Sécurité : on vérifie que 'place' est bien un dictionnaire
                 if not isinstance(place, dict): continue
 
                 nom = place.get("name")
@@ -74,17 +74,19 @@ def get_google_places(ville, place_type, categorie, emoji):
                 if not nom or not place_id: continue
 
                 note = place.get("rating", 0)
-                if note < 3.0: continue
+                # Filtre qualité : 3.5 minimum pour la prod
+                if note < 3.5: continue
 
-                # Extraction ultra-sécurisée de la photo
+                # Photo
                 image_url = None
                 photos = place.get("photos")
                 if isinstance(photos, list) and len(photos) > 0:
-                    first_photo = photos
-                    if isinstance(first_photo, dict):
-                        photo_ref = first_photo.get("photo_reference")
-                        if photo_ref:
-                            image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
+                    photo_ref = photos.get("photo_reference")
+                    if photo_ref:
+                        image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
+
+                # On génère un lien vers la fiche Google Maps qui met en avant le site web/réservation
+                google_link = f"https://www.google.com/maps/search/?api=1&query={nom.replace(' ', '+')}&query_place_id={place_id}"
 
                 deals.append({
                     "id": f"gp_{place_id}",
@@ -95,38 +97,37 @@ def get_google_places(ville, place_type, categorie, emoji):
                     "note": note,
                     "avis": place.get("user_ratings_total", 0),
                     "image": image_url,
-                    "url": f"https://www.google.com/maps/search/?api=1&query={nom.replace(' ', '+')}&query_place_id={place_id}"
+                    "url": google_link
                 })
-            except Exception as e_item:
-                logger.error(f"⚠️ Erreur sur un item : {e_item}")
+            except Exception:
                 continue
-
     except Exception as e:
-        logger.error(f"💥 Erreur API Google : {e}")
+        logger.error(f"💥 Erreur API : {e}")
     return deals
 
 def envoyer_telegram(deal):
+    # Texte optimisé pour la redirection vers le site via la fiche Google
     texte = (
         f"{deal['emoji']} *PROPOSITION CEZAP*\n\n"
         f"🎯 *{deal['titre']}*\n"
         f"📍 {deal['lieu']}\n"
         f"📂 {deal['categorie']}\n"
         f"⭐ {deal['note']}/5 ({deal['avis']} avis)\n\n"
-        f"🔗 [Voir sur Google Maps]({deal['url']})"
+        f"🔗 [🌐 Consulter / Réserver]({deal['url']})"
     )
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
     try:
         if deal['image']:
-            requests.post(base_url + "sendPhoto", data={"chat_id": CHAT_ID, "photo": deal['image'], "caption": texte, "parse_mode": "Markdown"}, timeout=10)
+            requests.post(base_url + "sendPhoto", data={"chat_id": CHAT_ID, "photo": deal['image'], "caption": texte, "parse_mode": "Markdown"}, timeout=15)
         else:
-            requests.post(base_url + "sendMessage", data={"chat_id": CHAT_ID, "text": texte, "parse_mode": "Markdown"}, timeout=10)
+            requests.post(base_url + "sendMessage", data={"chat_id": CHAT_ID, "text": texte, "parse_mode": "Markdown"}, timeout=15)
         logger.info(f"🚀 Succès : {deal['titre']}")
     except Exception as e:
         logger.error(f"💥 Erreur Telegram : {e}")
 
 def job():
-    logger.info("--- DÉMARRAGE SCAN ---")
+    logger.info("--- DÉMARRAGE DU SCAN CEZAP ---")
     init_db()
     total = 0
     for r in RECHERCHES:
@@ -136,15 +137,18 @@ def job():
                 envoyer_telegram(d)
                 save_alert(d["id"])
                 total += 1
-                time.sleep(1)
-    logger.info(f"--- FIN : {total} messages envoyés ---")
+                time.sleep(2) # Sécurité pour Telegram
+    logger.info(f"--- FIN DU SCAN : {total} nouveaux messages ---")
 
 if __name__ == "__main__":
-    if not GOOGLE_API_KEY:
-        logger.error("❌ Manque la clé Google")
+    if not all([TELEGRAM_TOKEN, CHAT_ID, GOOGLE_API_KEY]):
+        logger.error("❌ Variables d'environnement manquantes !")
     else:
+        # Lancement immédiat au démarrage
         job()
-        schedule.every(6).hours.do(job)
+        # Puis toutes les 8 heures
+        schedule.every(8).hours.do(job)
+        
         while True:
             schedule.run_pending()
             time.sleep(60)
