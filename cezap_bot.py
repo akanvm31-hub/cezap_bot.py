@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 import schedule
 import time
+import random
 import logging
 from datetime import datetime
 
@@ -28,6 +29,9 @@ RECHERCHES = [
 
 VILLES_COORDS = {"Paris": "48.8566,2.3522"}
 
+# Limite quotidienne d'alertes
+MAX_ALERTES_PAR_JOUR = 5
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     conn.execute("CREATE TABLE IF NOT EXISTS sent_alerts (item_id TEXT PRIMARY KEY, client TEXT, date_sent TEXT)")
@@ -46,8 +50,18 @@ def save_alert(item_id):
     conn.commit()
     conn.close()
 
+def alertes_envoyees_aujourdhui():
+    """Compte combien d'alertes ont ete envoyees aujourd'hui"""
+    conn = sqlite3.connect(DB_NAME)
+    today = datetime.now().strftime("%Y-%m-%d")
+    res = conn.execute(
+        "SELECT COUNT(*) FROM sent_alerts WHERE date_sent LIKE ?",
+        (f"{today}%",)
+    ).fetchone()
+    conn.close()
+    return res[0] if res else 0
+
 def get_place_details(place_id):
-    """Recupere le site web officiel et numero de telephone"""
     try:
         url = "https://maps.googleapis.com/maps/api/place/details/json"
         params = {
@@ -99,7 +113,6 @@ def get_google_places(ville, place_type, categorie, emoji):
                 if note < 3.5:
                     continue
 
-                # Photo
                 image_url = None
                 photos = place.get("photos")
                 if isinstance(photos, list) and len(photos) > 0:
@@ -107,13 +120,6 @@ def get_google_places(ville, place_type, categorie, emoji):
                     if photo_ref:
                         image_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
 
-                # Recuperer site officiel
-                details = get_place_details(place_id)
-                website = details.get("website")
-                phone = details.get("phone")
-                open_now = details.get("open_now")
-
-                # Lien direct vers site officiel sinon Google Maps
                 google_maps_link = f"https://www.google.com/maps/search/?api=1&query={nom.replace(' ', '+')}&query_place_id={place_id}"
 
                 deals.append({
@@ -125,10 +131,8 @@ def get_google_places(ville, place_type, categorie, emoji):
                     "note": note,
                     "avis": place.get("user_ratings_total", 0),
                     "image": image_url,
-                    "website": website,
-                    "phone": phone,
-                    "open_now": open_now,
-                    "google_maps": google_maps_link
+                    "google_maps": google_maps_link,
+                    "place_id": place_id
                 })
             except Exception:
                 continue
@@ -137,17 +141,22 @@ def get_google_places(ville, place_type, categorie, emoji):
     return deals
 
 def envoyer_telegram(deal):
+    # Recuperer details (site web, tel) au moment de l'envoi seulement
+    details = get_place_details(deal["place_id"])
+    website = details.get("website")
+    phone = details.get("phone")
+    open_now = details.get("open_now")
+
     open_status = ""
-    if deal.get("open_now") is True:
+    if open_now is True:
         open_status = "🟢 Ouvert maintenant\n"
-    elif deal.get("open_now") is False:
+    elif open_now is False:
         open_status = "🔴 Ferme maintenant\n"
 
-    phone_line = f"📞 {deal['phone']}\n" if deal.get("phone") else ""
+    phone_line = f"📞 {phone}\n" if phone else ""
 
-    # Lien principal : site officiel si dispo
-    if deal.get("website"):
-        lien_principal = f"🎟️ [Reserver sur le site officiel]({deal['website']})"
+    if website:
+        lien_principal = f"🎟️ [Reserver sur le site officiel]({website})"
         lien_secondaire = f"\n📍 [Voir sur Google Maps]({deal['google_maps']})"
     else:
         lien_principal = f"📍 [Voir sur Google Maps]({deal['google_maps']})"
@@ -178,15 +187,62 @@ def envoyer_telegram(deal):
 def job():
     logger.info("--- DEBUT DU SCAN CEZAP ---")
     init_db()
-    total = 0
+
+    # Verifier la limite quotidienne
+    deja_envoyees = alertes_envoyees_aujourdhui()
+    restantes = MAX_ALERTES_PAR_JOUR - deja_envoyees
+    logger.info(f"Deja envoyees aujourd'hui : {deja_envoyees} / {MAX_ALERTES_PAR_JOUR}")
+
+    if restantes <= 0:
+        logger.info("Quota quotidien atteint. Aucun envoi.")
+        return
+
+    # Collecter les nouvelles offres pour CHAQUE categorie
+    offres_par_categorie = {}
     for r in RECHERCHES:
         deals = get_google_places(r["ville"], r["type"], r["categorie"], r["emoji"])
-        for d in deals:
-            if is_new(d["id"]):
-                envoyer_telegram(d)
-                save_alert(d["id"])
-                total += 1
-                time.sleep(2)
+        nouvelles = [d for d in deals if is_new(d["id"])]
+        if nouvelles:
+            offres_par_categorie[r["categorie"]] = nouvelles
+
+    if not offres_par_categorie:
+        logger.info("Aucune nouvelle offre trouvee.")
+        return
+
+    # Selection variee : 1 offre par categorie en priorite
+    selection = []
+    categories_dispo = list(offres_par_categorie.keys())
+    random.shuffle(categories_dispo)
+
+    for cat in categories_dispo:
+        if len(selection) >= restantes:
+            break
+        # Prendre la meilleure offre (premiere apres tri par note)
+        meilleure = sorted(offres_par_categorie[cat], key=lambda x: x["note"], reverse=True)[0]
+        selection.append(meilleure)
+
+    # Si on n'a pas atteint la limite, completer avec autres offres
+    if len(selection) < restantes:
+        toutes_autres = []
+        ids_selection = {d["id"] for d in selection}
+        for cat, deals in offres_par_categorie.items():
+            for d in deals:
+                if d["id"] not in ids_selection:
+                    toutes_autres.append(d)
+        random.shuffle(toutes_autres)
+        for d in toutes_autres:
+            if len(selection) >= restantes:
+                break
+            selection.append(d)
+
+    # Envoyer la selection
+    total = 0
+    for d in selection:
+        envoyer_telegram(d)
+        save_alert(d["id"])
+        total += 1
+        time.sleep(2)
+
     logger.info(f"--- FIN DU SCAN : {total} nouveaux messages ---")
 
 if __name__ == "__main__":
